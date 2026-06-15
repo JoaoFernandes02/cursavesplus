@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cursaves"
+version = "0.11.0"
+description = "Sync Cursor agent chat sessions between machines"
+readme = "README.md"
+license = "AGPL-3.0-only"
+requires-python = ">=3.10"
+dependencies = [
+    "InquirerPy>=0.3.4",
+    "customtkinter>=5.2.0",
+]
+
+[project.optional-dependencies]
+s3 = ["boto3"]
+
+[project.scripts]
+cursaves = "cursor_saves.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cursor_saves"]
+
+[project.urls]
+Repository = "https://github.com/Callum-Ward/cursaves"

@@ -1,0 +1,1854 @@
+"""Import operations -- writes to Cursor's databases with safety checks."""
+
+import gzip
+import json
+import os
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+from typing import Any, Optional
+
+from . import db, paths
+
+
+def _get_shard_paths(base_path: Path) -> list[Path]:
+    """Return ordered shard paths for a sharded snapshot, or empty list."""
+    shards = sorted(base_path.parent.glob(f"{base_path.name}.*"))
+    return [s for s in shards if s.suffix.lstrip(".").isdigit()]
+
+
+def read_snapshot_file(path: Path) -> dict:
+    """Read a snapshot file (supports .json, .json.gz, and sharded .json.gz.NN)."""
+    if path.suffix == ".gz":
+        # Check for shards first
+        shards = _get_shard_paths(path)
+        if shards and not path.exists():
+            compressed = b"".join(s.read_bytes() for s in shards)
+            raw = gzip.decompress(compressed)
+            return json.loads(raw)
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    else:
+        return json.loads(path.read_text())
+
+
+def list_snapshot_files(directory: Path) -> list[Path]:
+    """List all logical snapshot files in a directory.
+
+    Returns one Path per snapshot. For sharded snapshots (*.json.gz.00, .01, ...),
+    returns the base path (*.json.gz) even though that file doesn't exist on disk.
+    Excludes .meta.json sidecar files.
+    """
+    files = set()
+    for f in directory.glob("*.json"):
+        if not f.name.endswith(".meta.json"):
+            files.add(f)
+    files.update(directory.glob("*.json.gz"))
+
+    # Detect sharded snapshots: *.json.gz.00 indicates a sharded set
+    for f in directory.glob("*.json.gz.00"):
+        base = f.parent / f.name[:-3]  # strip ".00"
+        files.add(base)
+
+    # Remove individual shard files from the set (they're represented by the base)
+    files = {f for f in files if not (f.suffix.lstrip(".").isdigit() and ".json.gz." in f.name)}
+
+    return sorted(files)
+
+
+def read_snapshot_meta(snapshot_path: Path) -> dict:
+    """Read snapshot metadata from the sidecar .meta.json file.
+
+    Falls back to reading the full snapshot if no sidecar exists.
+    Returns a dict with: composerId, name, messageCount, exportedAt,
+    sourceMachine, sourceProjectPath, projectIdentifier.
+    """
+    # Try sidecar first (instant)
+    stem = snapshot_path.stem
+    if stem.endswith(".json"):
+        stem = stem[:-5]
+    meta_path = snapshot_path.parent / f"{stem}.meta.json"
+    if meta_path.exists():
+        try:
+            return json.loads(meta_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Fallback: read full snapshot (slow for large files)
+    try:
+        data = read_snapshot_file(snapshot_path)
+        cd = data.get("composerData", {})
+        return {
+            "composerId": data.get("composerId"),
+            "name": cd.get("name"),
+            "messageCount": len(cd.get("fullConversationHeadersOnly", [])),
+            "exportedAt": data.get("exportedAt"),
+            "sourceMachine": data.get("sourceMachine"),
+            "sourceHost": data.get("sourceHost"),
+            "sourceProjectPath": data.get("sourceProjectPath"),
+            "projectIdentifier": data.get("projectIdentifier"),
+            "version": data.get("version"),
+        }
+    except Exception:
+        return {
+            "composerId": stem,
+            "name": None,
+            "messageCount": 0,
+            "exportedAt": None,
+            "sourceMachine": None,
+            "sourceProjectPath": None,
+        }
+
+
+def is_cursor_running() -> bool:
+    """Check if the main Cursor app process is running."""
+    system = __import__("platform").system()
+
+    if system == "Darwin":
+        return _is_cursor_running_macos()
+    if system == "Linux":
+        return _is_cursor_running_linux()
+    if system == "Windows":
+        return _is_cursor_running_windows()
+    return False
+
+
+def _is_cursor_running_macos() -> bool:
+    """On macOS, pgrep -x fails because the comm field is truncated to 16 chars."""
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "args"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return False
+        for line in result.stdout.splitlines():
+            if "Cursor.app/Contents/MacOS/Cursor" in line \
+                    and "Helper" not in line \
+                    and "Frameworks" not in line:
+                return True
+        return False
+    except FileNotFoundError:
+        return False
+
+
+def _is_cursor_running_linux() -> bool:
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", "cursor"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return True
+        result = subprocess.run(
+            ["pgrep", "-f", r"Cursor.*--"],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except FileNotFoundError:
+        return False
+
+
+def _is_cursor_running_windows() -> bool:
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq Cursor.exe", "/NH"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return False
+        return "Cursor.exe" in result.stdout
+    except FileNotFoundError:
+        return False
+
+
+_SKIP_REWRITE_KEYS = frozenset({"conversationState"})
+
+
+def rewrite_paths(data: Any, old_prefix: str, new_prefix: str) -> Any:
+    """Recursively rewrite absolute paths in conversation data.
+
+    Replaces old_prefix with new_prefix in all string values that
+    look like file paths.  Skips binary/encoded fields like
+    ``conversationState`` (base64-encoded protobuf) that should
+    never be modified.
+    """
+    if isinstance(data, str):
+        if old_prefix in data:
+            return data.replace(old_prefix, new_prefix)
+        return data
+    elif isinstance(data, dict):
+        return {
+            k: (v if k in _SKIP_REWRITE_KEYS else rewrite_paths(v, old_prefix, new_prefix))
+            for k, v in data.items()
+        }
+    elif isinstance(data, list):
+        return [rewrite_paths(item, old_prefix, new_prefix) for item in data]
+    else:
+        return data
+
+
+def find_or_create_workspace(project_path: str) -> Path:
+    """Find an existing workspace dir for the project, or create a new one.
+
+    Returns the workspace directory path.
+    """
+    # Check for existing workspace
+    existing = paths.find_workspace_dirs_for_project(project_path)
+    if existing:
+        return existing[0]  # Use the most recent one
+
+    # Create a new workspace directory
+    ws_storage = paths.get_workspace_storage_dir()
+    ws_id = uuid.uuid4().hex  # Random 32-char hex ID
+    ws_dir = ws_storage / ws_id
+    ws_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create workspace.json
+    folder_uri = paths.path_to_file_uri(project_path)
+    ws_json = ws_dir / "workspace.json"
+    ws_json.write_text(json.dumps({"folder": folder_uri}))
+
+    # Create an empty state.vscdb
+    _init_workspace_db(ws_dir / "state.vscdb")
+
+    return ws_dir
+
+
+def _init_workspace_db(db_path: Path):
+    """Create a minimal state.vscdb with the required tables."""
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE, value BLOB)")
+    conn.execute("CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT UNIQUE, value BLOB)")
+    conn.commit()
+    conn.close()
+
+
+def _check_conflict(
+    global_db_path: Path,
+    composer_id: str,
+    incoming_bubble_ids: set[str],
+    incoming_header_ids: Optional[set[str]] = None,
+) -> str:
+    """Compare local chat state against incoming snapshot.
+
+    Compares both bubble IDs and conversation header IDs to determine
+    the relationship. This is necessary because bubbles can exist locally
+    (from a previous import) without being listed in the composerData
+    headers, making bubble-only comparison misleading.
+
+    Returns one of:
+      "new"            - chat doesn't exist locally
+      "identical"      - same messages in both
+      "incoming_newer" - incoming has content the local doesn't
+      "local_ahead"    - local has all incoming content plus more
+      "diverged"       - both have content the other doesn't
+    """
+    if not global_db_path.exists():
+        return "new"
+
+    with db.CursorDB(global_db_path) as cdb:
+        local_keys = cdb.list_keys(f"bubbleId:{composer_id}:")
+        local_data = cdb.get_json(f"composerData:{composer_id}")
+
+    if not local_keys:
+        return "new"
+
+    if not incoming_bubble_ids:
+        return "local_ahead"
+
+    prefix_len = len(f"bubbleId:{composer_id}:")
+    local_bubble_ids = {k[prefix_len:] for k in local_keys}
+
+    local_only_bubbles = local_bubble_ids - incoming_bubble_ids
+    incoming_only_bubbles = incoming_bubble_ids - local_bubble_ids
+
+    # Also compare headers if provided
+    local_header_ids = set()
+    if local_data:
+        local_header_ids = {
+            h.get("bubbleId") for h in local_data.get("fullConversationHeadersOnly", [])
+            if h.get("bubbleId")
+        }
+    incoming_only_headers = set()
+    if incoming_header_ids:
+        incoming_only_headers = incoming_header_ids - local_header_ids
+
+    has_local_only = bool(local_only_bubbles)
+    has_incoming_only = bool(incoming_only_bubbles) or bool(incoming_only_headers)
+
+    if not has_local_only and not has_incoming_only:
+        return "identical"
+    elif has_local_only and has_incoming_only:
+        return "diverged"
+    elif has_local_only:
+        return "local_ahead"
+    else:
+        return "incoming_newer"
+
+
+def import_snapshot(
+    snapshot_path: Path,
+    target_project_path: str,
+    target_workspace_dir: Optional[Path] = None,
+    skip_backup: bool = False,
+) -> bool:
+    """Import a conversation snapshot into Cursor's databases.
+
+    Args:
+        snapshot_path: Path to the .json snapshot file.
+        target_project_path: The project path on this machine.
+        target_workspace_dir: Optional workspace directory to import into.
+            If not provided, uses find_or_create_workspace() to find/create one.
+        skip_backup: If True, skip creating DB backups (caller handles it).
+
+    Returns True on success, False on failure.
+    """
+    # Load snapshot
+    try:
+        snapshot = read_snapshot_file(snapshot_path)
+    except (json.JSONDecodeError, OSError, gzip.BadGzipFile) as e:
+        print(f"Error reading snapshot: {e}", file=sys.stderr)
+        return False
+
+    if snapshot.get("version") not in (1, 2, 3):
+        print(f"Error: Unsupported snapshot version: {snapshot.get('version')}", file=sys.stderr)
+        return False
+
+    composer_id = snapshot["composerId"]
+    source_path = snapshot.get("sourceProjectPath", "")
+    target_path = os.path.normpath(target_project_path)
+
+    composer_data = snapshot["composerData"]
+
+    # Skip empty conversations (new-but-never-used chats)
+    headers = composer_data.get("fullConversationHeadersOnly", [])
+    if not headers and not composer_data.get("name"):
+        print(f"  Skipping empty conversation {composer_id[:12]}...")
+        return True  # Not an error, just nothing to import
+
+    # Rewrite paths if the project is at a different location
+    if source_path and source_path != target_path:
+        print(f"  Rewriting paths: {source_path} -> {target_path}")
+        composer_data = rewrite_paths(composer_data, source_path, target_path)
+
+    content_blobs = snapshot.get("contentBlobs", {})
+    message_contexts = snapshot.get("messageContexts", {})
+    bubble_entries = snapshot.get("bubbleEntries", {})
+    checkpoints = snapshot.get("checkpoints", {})
+    agent_blobs = snapshot.get("agentBlobs", {})
+
+    # ── Conflict check ──────────────────────────────────────────────
+    global_db_path = paths.get_global_db_path()
+    incoming_bubble_ids = set(bubble_entries.keys())
+    incoming_header_ids = {
+        h.get("bubbleId") for h in headers if h.get("bubbleId")
+    }
+    conflict = _check_conflict(
+        global_db_path, composer_id, incoming_bubble_ids, incoming_header_ids,
+    )
+    chat_name = composer_data.get("name", "Untitled")
+    source_label = snapshot.get("sourceHost") or snapshot.get("sourceMachine") or "remote"
+
+    if conflict == "local_ahead":
+        with db.CursorDB(global_db_path) as cdb:
+            ld = cdb.get_json(f"composerData:{composer_id}")
+        local_count = len((ld or {}).get("fullConversationHeadersOnly", []))
+        snap_count = len(headers)
+        print(
+            f"  Skipped: \"{chat_name}\" — local has {local_count} msgs, "
+            f"snapshot has {snap_count} (local is newer, nothing to import)"
+        )
+        return True
+
+    if conflict == "identical":
+        print(f"  Skipped: \"{chat_name}\" — already up to date ({len(headers)} msgs)")
+        return True
+
+    if conflict == "new":
+        print(f"  New chat: \"{chat_name}\" ({len(headers)} msgs from {source_label})")
+
+    if conflict == "incoming_newer":
+        with db.CursorDB(global_db_path) as cdb:
+            ld = cdb.get_json(f"composerData:{composer_id}")
+        local_count = len((ld or {}).get("fullConversationHeadersOnly", []))
+        snap_count = len(headers)
+        print(
+            f"  Updating: \"{chat_name}\" — local has {local_count} msgs, "
+            f"snapshot has {snap_count} from {source_label}"
+        )
+
+    if conflict == "diverged":
+        # Both local and incoming have unique messages — they've branched.
+        # Keep the local version untouched and import the incoming snapshot
+        # as a separate conversation with a new ID and a renamed title.
+        new_id = str(uuid.uuid4())
+        new_name = f"{chat_name} (from {source_label})"
+        composer_data["composerId"] = new_id
+        composer_data["name"] = new_name
+        composer_id = new_id
+        print(
+            f"  Diverged: \"{chat_name}\" — local and {source_label} both have unique messages"
+        )
+        print(
+            f"            Importing as separate chat: \"{new_name}\""
+        )
+
+    # ── Step 1: Backup global DB ────────────────────────────────────
+    if not skip_backup and global_db_path.exists():
+        backup_path = db.backup_db(global_db_path)
+        print(f"  Backed up global DB to {backup_path.name}")
+
+    # ── Step 2: Write conversation data to global DB ────────────────
+    global_cdb = db.CursorDB(global_db_path)
+    try:
+        # Write the main conversation data
+        global_cdb.write_json(f"composerData:{composer_id}", composer_data)
+
+        # Write content blobs
+        if content_blobs:
+            global_cdb.write_batch(
+                [(f"composer.content.{h}", v) for h, v in content_blobs.items()]
+            )
+
+        # Write message contexts (batch)
+        if message_contexts:
+            global_cdb.write_json_batch([
+                (f"messageRequestContext:{composer_id}:{msg_key}", context)
+                for msg_key, context in message_contexts.items()
+            ])
+
+        # Write bubble entries in a single transaction (can be 50K+ entries)
+        if bubble_entries:
+            if source_path and source_path != target_path:
+                bubble_entries = {
+                    bid: rewrite_paths(bdata, source_path, target_path)
+                    for bid, bdata in bubble_entries.items()
+                }
+            global_cdb.write_json_batch([
+                (f"bubbleId:{composer_id}:{bubble_id}", bubble_data)
+                for bubble_id, bubble_data in bubble_entries.items()
+            ])
+
+        # Write checkpoint data (workspace state snapshots for agent continuation)
+        if checkpoints:
+            if source_path and source_path != target_path:
+                checkpoints = {
+                    cp_id: rewrite_paths(cp_data, source_path, target_path)
+                    for cp_id, cp_data in checkpoints.items()
+                }
+            global_cdb.write_json_batch([
+                (f"checkpointId:{composer_id}:{cp_id}", cp_data)
+                for cp_id, cp_data in checkpoints.items()
+            ])
+
+        # Write agent state blobs (encrypted context for conversation continuation)
+        if agent_blobs:
+            import base64
+            global_cdb.write_batch([
+                (f"agentKv:blob:{bid}", base64.b64decode(bdata))
+                for bid, bdata in agent_blobs.items()
+            ])
+    finally:
+        global_cdb.close()
+
+    # ── Step 3: Register conversation in workspace DB ───────────────
+    if target_workspace_dir is not None:
+        ws_dir = target_workspace_dir
+    else:
+        ws_dir = find_or_create_workspace(target_path)
+    ws_db_path = ws_dir / "state.vscdb"
+
+    if not skip_backup and ws_db_path.exists():
+        backup_path = db.backup_db(ws_db_path)
+        print(f"  Backed up workspace DB to {backup_path.name}")
+
+    _register_in_workspace(composer_id, composer_data, ws_dir)
+
+    # ── Step 4: Verify writes ─────────────────────────────────────────
+    verify_cdb = db.CursorDB(global_db_path)
+    try:
+        written = verify_cdb.get_json(f"composerData:{composer_id}")
+        if not written:
+            print("  WARNING: composerData not found in global DB after write!", file=sys.stderr)
+            return False
+        if bubble_entries:
+            sample_key = next(iter(bubble_entries))
+            sample = verify_cdb.get_json(f"bubbleId:{composer_id}:{sample_key}")
+            if not sample:
+                print("  WARNING: bubble entries not found in global DB after write!", file=sys.stderr)
+                return False
+
+        final_name = composer_data.get("name", chat_name)
+        final_msgs = len(written.get("fullConversationHeadersOnly", []))
+        if conflict == "new":
+            print(f"  Imported: \"{final_name}\" ({final_msgs} msgs, {len(bubble_entries)} bubbles)")
+        elif conflict == "diverged":
+            print(f"  Copied: \"{final_name}\" ({final_msgs} msgs) — original \"{chat_name}\" left unchanged")
+        elif conflict == "incoming_newer":
+            print(f"  Updated: \"{final_name}\" → {final_msgs} msgs")
+        else:
+            print(f"  Done: \"{final_name}\" ({final_msgs} msgs)")
+    finally:
+        verify_cdb.close()
+
+    return True
+
+
+def get_sync_status_for_snapshot(
+    composer_id: str,
+    snapshot_msg_count: int,
+    _cdb: "Optional[db.CursorDB]" = None,
+) -> str:
+    """Lightweight sync status check using only message counts.
+
+    Compares the local header count against the snapshot's messageCount
+    from the .meta.json sidecar (no decompression needed).
+
+    Pass an open CursorDB via _cdb to avoid re-copying the global DB.
+
+    Returns one of:
+      "not_local"     - conversation doesn't exist in local DB
+      "up_to_date"    - same message count
+      "local_ahead"   - local has more messages than snapshot
+      "behind"        - snapshot has more messages than local
+    """
+    if _cdb is not None:
+        local_data = _cdb.get_json(f"composerData:{composer_id}")
+    else:
+        global_db_path = paths.get_global_db_path()
+        if not global_db_path.exists():
+            return "not_local"
+        with db.CursorDB(global_db_path) as cdb:
+            local_data = cdb.get_json(f"composerData:{composer_id}")
+
+    if not local_data:
+        return "not_local"
+
+    local_count = len(local_data.get("fullConversationHeadersOnly", []))
+
+    if local_count == snapshot_msg_count:
+        return "up_to_date"
+    elif local_count > snapshot_msg_count:
+        return "local_ahead"
+    else:
+        return "behind"
+
+
+def get_push_status_for_conversation(
+    composer_id: str,
+    project_identifier: str,
+    _cdb: "Optional[db.CursorDB]" = None,
+) -> str:
+    """Check whether a local conversation has been pushed and if the snapshot is current.
+
+    Pass an open CursorDB via _cdb to avoid re-copying the global DB.
+
+    Returns one of:
+      "never_pushed"  - no snapshot exists for this conversation
+      "up_to_date"    - snapshot matches local message count
+      "local_ahead"   - local has more messages than the snapshot
+      "behind"        - snapshot has more messages (pushed from elsewhere)
+    """
+    snapshots_dir = paths.get_snapshots_dir()
+    project_dir = snapshots_dir / project_identifier
+    if not project_dir.exists():
+        return "never_pushed"
+
+    meta_path = project_dir / f"{composer_id}.meta.json"
+    if not meta_path.exists():
+        return "never_pushed"
+
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return "never_pushed"
+
+    snapshot_count = meta.get("messageCount", 0)
+
+    if _cdb is not None:
+        local_data = _cdb.get_json(f"composerData:{composer_id}")
+    else:
+        global_db_path = paths.get_global_db_path()
+        with db.CursorDB(global_db_path) as cdb:
+            local_data = cdb.get_json(f"composerData:{composer_id}")
+
+    if not local_data:
+        return "never_pushed"
+
+    local_count = len(local_data.get("fullConversationHeadersOnly", []))
+
+    if local_count == snapshot_count:
+        return "up_to_date"
+    elif local_count > snapshot_count:
+        return "local_ahead"
+    else:
+        return "behind"
+
+
+_SYNC_STATUS_LABELS = {
+    "not_local": "new",
+    "up_to_date": "synced",
+    "local_ahead": "ahead",
+    "behind": "behind",
+    "never_pushed": "not pushed",
+}
+
+
+def format_sync_status(status: str) -> str:
+    """Return a short human-readable label for a sync status."""
+    return _SYNC_STATUS_LABELS.get(status, status)
+
+
+def list_snapshot_projects(snapshots_dir: Optional[Path] = None) -> list[dict]:
+    """List all project directories in the snapshots store.
+
+    Returns list of dicts with: name, path, count, source_paths (set of
+    sourceProjectPath values found in snapshots), sources (set of
+    sourceMachine values).
+    """
+    if snapshots_dir is None:
+        snapshots_dir = paths.get_snapshots_dir()
+
+    if not snapshots_dir.exists():
+        return []
+
+    projects = []
+    for project_dir in sorted(snapshots_dir.iterdir()):
+        if not project_dir.is_dir():
+            continue
+        snapshot_files = list_snapshot_files(project_dir)
+        if not snapshot_files:
+            continue
+
+        source_paths = set()
+        source_machines = set()
+        latest_export = None
+        for sf in snapshot_files:
+            meta = read_snapshot_meta(sf)
+            sp = meta.get("sourceProjectPath", "")
+            if sp:
+                source_paths.add(sp)
+            sm = meta.get("sourceMachine", "")
+            if sm:
+                source_machines.add(sm)
+            exported_at = meta.get("exportedAt", "")
+            if exported_at and (latest_export is None or exported_at > latest_export):
+                latest_export = exported_at
+
+        projects.append({
+            "name": project_dir.name,
+            "path": project_dir,
+            "count": len(snapshot_files),
+            "source_paths": source_paths,
+            "sources": source_machines,
+            "latest_export": latest_export,
+        })
+
+    return projects
+
+
+def find_snapshot_dir_for_project(
+    target_project_path: str,
+    snapshots_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """Find the snapshot directory matching a project path.
+
+    Tries in order:
+    1. Exact match by project identifier (git remote URL based)
+    2. Basename match (for SSH workspaces where git -C fails locally)
+    3. Scan snapshot metadata for matching sourceProjectPath basenames
+
+    Returns the snapshot directory path, or None.
+    """
+    if snapshots_dir is None:
+        snapshots_dir = paths.get_snapshots_dir()
+
+    # 1. Exact match by project identifier
+    project_id = paths.get_project_identifier(target_project_path)
+    exact = snapshots_dir / project_id
+    if exact.exists() and list_snapshot_files(exact):
+        return exact
+
+    # 2. Basename match (covers SSH workspace push → local pull)
+    basename = os.path.basename(os.path.normpath(target_project_path))
+    basename_dir = snapshots_dir / basename
+    if basename_dir.exists() and basename_dir != exact and list_snapshot_files(basename_dir):
+        return basename_dir
+
+    # 3. Scan snapshot dirs for matching source path basenames
+    # This handles the case where the project was pushed from a different
+    # machine with a different directory structure but same repo
+    for project_dir in snapshots_dir.iterdir():
+        if not project_dir.is_dir() or project_dir == exact or project_dir == basename_dir:
+            continue
+        # Check first snapshot file for a matching source path basename
+        for sf in list_snapshot_files(project_dir):
+            try:
+                data = read_snapshot_file(sf)
+                source_path = data.get("sourceProjectPath", "")
+                if source_path and os.path.basename(os.path.normpath(source_path)) == basename:
+                    return project_dir
+            except (json.JSONDecodeError, OSError, gzip.BadGzipFile):
+                pass
+            break  # Only need to check one file per directory
+
+    return None
+
+
+def import_from_snapshot_dir(
+    snapshot_dir: Path,
+    target_project_path: str,
+    force: bool = False,
+    target_workspace_dir: Optional[Path] = None,
+) -> tuple[int, int]:
+    """Import all snapshots from a specific snapshot directory.
+
+    Args:
+        snapshot_dir: Directory containing snapshot files.
+        target_project_path: The project path on this machine.
+        force: Suppress Cursor-running warning.
+        target_workspace_dir: Optional workspace directory to import into.
+
+    Returns (success_count, failure_count).
+    """
+    if not force and is_cursor_running():
+        print(
+            "WARNING: Cursor is running. Close Cursor FIRST (Cmd+Q / quit),\n"
+            "then import, then reopen Cursor. If you import while Cursor is\n"
+            "running, Cursor will overwrite the sidebar registration on exit\n"
+            "and the imported chats will disappear.\n"
+            "Use --force to import anyway (not recommended).\n",
+            file=sys.stderr,
+        )
+        return 0, 0
+
+    snapshot_files = list_snapshot_files(snapshot_dir)
+    if not snapshot_files:
+        return 0, 0
+
+    # Back up DBs once for the entire batch (global DB can be multi-GB)
+    global_db_path = paths.get_global_db_path()
+    if global_db_path.exists():
+        backup_path = db.backup_db(global_db_path)
+        print(f"Backed up global DB to {backup_path.name}")
+
+    if target_workspace_dir is not None:
+        ws_dir = target_workspace_dir
+    else:
+        ws_dir = find_or_create_workspace(os.path.normpath(target_project_path))
+    ws_db_path = ws_dir / "state.vscdb"
+    if ws_db_path.exists():
+        backup_path = db.backup_db(ws_db_path)
+        print(f"Backed up workspace DB to {backup_path.name}")
+
+    success = 0
+    failure = 0
+
+    for sf in snapshot_files:
+        print(f"Importing {sf.name}...")
+        if import_snapshot(sf, target_project_path, ws_dir, skip_backup=True):
+            success += 1
+            print(f"  OK")
+        else:
+            failure += 1
+            print(f"  FAILED")
+
+    return success, failure
+
+
+def import_all_snapshots(
+    target_project_path: str,
+    snapshots_dir: Optional[Path] = None,
+    force: bool = False,
+    target_workspace_dir: Optional[Path] = None,
+) -> tuple[int, int]:
+    """Import all snapshots for a project.
+
+    Args:
+        target_project_path: The project path on this machine.
+        snapshots_dir: Directory containing snapshot subdirectories.
+        force: Suppress Cursor-running warning.
+        target_workspace_dir: Optional workspace directory to import into.
+
+    Returns (success_count, failure_count).
+    """
+    if not force and is_cursor_running():
+        print(
+            "WARNING: Cursor is running. Close Cursor FIRST (Cmd+Q / quit),\n"
+            "then import, then reopen Cursor. If you import while Cursor is\n"
+            "running, Cursor will overwrite the sidebar registration on exit\n"
+            "and the imported chats will disappear.\n"
+            "Use --force to import anyway (not recommended).\n",
+            file=sys.stderr,
+        )
+        return 0, 0
+
+    if snapshots_dir is None:
+        snapshots_dir = paths.get_snapshots_dir()
+
+    project_snapshots = find_snapshot_dir_for_project(target_project_path, snapshots_dir)
+
+    if not project_snapshots:
+        project_id = paths.get_project_identifier(target_project_path)
+        print(f"No snapshots found for project '{project_id}'", file=sys.stderr)
+        print(f"Run 'cursaves snapshots' to see available snapshot projects.", file=sys.stderr)
+        return 0, 0
+
+    project_id = paths.get_project_identifier(target_project_path)
+    if project_snapshots.name != project_id:
+        print(
+            f"Note: Matched snapshots at {project_snapshots.name}/ "
+            f"(looked for {project_id})",
+            file=sys.stderr,
+        )
+
+    return import_from_snapshot_dir(
+        project_snapshots, target_project_path, force=force,
+        target_workspace_dir=target_workspace_dir,
+    )
+
+
+# ── Local workspace copy ───────────────────────────────────────────────
+
+
+def _build_composer_header_entry(composer_id: str, composer_data: dict) -> dict:
+    """Build a composer header entry suitable for both allComposers and
+    composer.composerHeaders."""
+    return {
+        "type": "head",
+        "composerId": composer_id,
+        "lastUpdatedAt": composer_data.get("lastUpdatedAt", composer_data.get("createdAt", 0)),
+        "createdAt": composer_data.get("createdAt", 0),
+        "unifiedMode": composer_data.get("unifiedMode", "agent"),
+        "forceMode": composer_data.get("forceMode", ""),
+        "hasUnreadMessages": False,
+        "totalLinesAdded": composer_data.get("totalLinesAdded", 0),
+        "totalLinesRemoved": composer_data.get("totalLinesRemoved", 0),
+        "filesChangedCount": composer_data.get("filesChangedCount", 0),
+        "subtitle": composer_data.get("subtitle", ""),
+        "isArchived": False,
+        "isDraft": False,
+        "isWorktree": False,
+        "isSpec": False,
+        "isBestOfNSubcomposer": False,
+        "numSubComposers": len(composer_data.get("subComposerIds", [])),
+        "referencedPlans": [],
+        "name": composer_data.get("name", "Imported conversation"),
+    }
+
+
+def _build_workspace_identifier(ws_dir: Path) -> dict:
+    """Build a workspaceIdentifier dict from a workspace directory.
+
+    Reads workspace.json to get the folder URI and constructs the
+    identifier format used by Cursor 3.0's composer.composerHeaders.
+    """
+    import json as _json
+    ws_json = ws_dir / "workspace.json"
+    ws_hash = ws_dir.name
+    if not ws_json.exists():
+        return {"id": ws_hash}
+
+    try:
+        data = _json.loads(ws_json.read_text())
+    except Exception:
+        return {"id": ws_hash}
+
+    folder_uri = data.get("folder", data.get("workspace", ""))
+    if not folder_uri:
+        return {"id": ws_hash}
+
+    uri_obj: dict = {"$mid": 1}
+    if folder_uri.startswith("file://"):
+        fs_path = paths.file_uri_to_path(folder_uri)
+        uri_obj["fsPath"] = fs_path
+        uri_obj["path"] = fs_path
+        uri_obj["external"] = folder_uri
+        uri_obj["scheme"] = "file"
+    elif folder_uri.startswith("vscode-remote://"):
+        parts = folder_uri.split("/", 3)
+        authority = parts[2] if len(parts) > 2 else ""
+        fs_path = "/" + parts[3] if len(parts) > 3 else "/"
+        uri_obj["fsPath"] = fs_path
+        uri_obj["path"] = fs_path
+        uri_obj["external"] = folder_uri
+        uri_obj["scheme"] = "vscode-remote"
+        uri_obj["authority"] = authority
+    else:
+        return {"id": ws_hash}
+
+    return {"id": ws_hash, "uri": uri_obj}
+
+
+def _register_in_global_headers(
+    composer_id: str,
+    composer_data: dict,
+    ws_dir: Path,
+) -> None:
+    """Register a conversation in the global composer.composerHeaders index.
+
+    This is the Cursor 3.0+ central index that maps chats to workspaces.
+    Safe to call on any Cursor version — creates the index if absent.
+    """
+    global_db_path = paths.get_global_db_path()
+    global_cdb = db.CursorDB(global_db_path)
+    try:
+        headers = global_cdb.get_json("composer.composerHeaders", table="ItemTable")
+        if headers is None:
+            headers = {"allComposers": []}
+
+        all_composers = headers.get("allComposers", [])
+        existing_ids = {c.get("composerId") for c in all_composers}
+
+        if composer_id not in existing_ids:
+            entry = _build_composer_header_entry(composer_id, composer_data)
+            entry["workspaceIdentifier"] = _build_workspace_identifier(ws_dir)
+            all_composers.append(entry)
+            headers["allComposers"] = all_composers
+            global_cdb.write_json("composer.composerHeaders", headers, table="ItemTable")
+            paths.invalidate_headers_cache()
+    finally:
+        global_cdb.close()
+
+
+def _register_in_workspace(
+    composer_id: str,
+    composer_data: dict,
+    ws_dir: Path,
+) -> bool:
+    """Register a conversation in a workspace's sidebar.
+
+    The conversation data must already exist in the global DB.
+    Handles both Cursor 2.x (allComposers) and 3.0+ schemas.
+
+    For Cursor 3.0+, writes to the global composer.composerHeaders
+    index (the authoritative source) and the workspace's
+    selectedComposerIds.
+    """
+    ws_db_path = ws_dir / "state.vscdb"
+    ws_cdb = db.CursorDB(ws_db_path)
+    try:
+        existing = ws_cdb.get_json("composer.composerData", table="ItemTable")
+        if existing is None:
+            existing = {"selectedComposerIds": []}
+
+        is_migrated = "allComposers" not in existing
+
+        if not is_migrated:
+            # Cursor 2.x: write to allComposers
+            all_composers = existing.get("allComposers", [])
+            existing_ids = {c.get("composerId") for c in all_composers}
+
+            if composer_id not in existing_ids:
+                entry = _build_composer_header_entry(composer_id, composer_data)
+                all_composers.append(entry)
+                existing["allComposers"] = all_composers
+
+        # Both schemas: add to selectedComposerIds
+        selected = existing.get("selectedComposerIds", [])
+        if composer_id not in selected:
+            selected.append(composer_id)
+            existing["selectedComposerIds"] = selected
+
+        if "lastFocusedComposerIds" in existing:
+            focused = existing["lastFocusedComposerIds"]
+            if composer_id not in focused:
+                focused.append(composer_id)
+
+        existing.setdefault("hasMigratedComposerData", True)
+        existing.setdefault("hasMigratedMultipleComposers", True)
+
+        ws_cdb.write_json("composer.composerData", existing, table="ItemTable")
+
+        # Cursor 3.0+: register in the global headers index
+        if is_migrated:
+            _register_in_global_headers(composer_id, composer_data, ws_dir)
+
+        return True
+    finally:
+        ws_cdb.close()
+
+
+def copy_between_workspaces(
+    composer_ids: list[str],
+    source_ws_dir: Path,
+    target_ws_dir: Path,
+    source_path: str,
+    target_path: str,
+    force: bool = False,
+) -> tuple[int, int]:
+    """Deep copy conversations between workspaces on the same machine.
+
+    Creates independent copies with new composerIds and rewrites file
+    paths from source to target workspace.
+
+    Returns (success_count, failure_count).
+    """
+    if not force and is_cursor_running():
+        print(
+            "WARNING: Cursor is running. Close Cursor FIRST (Cmd+Q / quit),\n"
+            "then run this command, then reopen Cursor.\n"
+            "Use --force to override (not recommended).\n",
+            file=sys.stderr,
+        )
+        return 0, 0
+
+    global_db_path = paths.get_global_db_path()
+    source_norm = os.path.normpath(source_path)
+    target_norm = os.path.normpath(target_path)
+    needs_rewrite = source_norm != target_norm
+    success = 0
+    failure = 0
+
+    # Read target workspace's existing chats for conflict detection
+    target_db_path = target_ws_dir / "state.vscdb"
+    target_names = {}
+    if target_db_path.exists():
+        target_ids = paths.get_workspace_composer_ids(target_db_path)
+        if target_ids:
+            with db.CursorDB(paths.get_global_db_path()) as gcdb:
+                for cid in target_ids:
+                    cd = gcdb.get_json(f"composerData:{cid}")
+                    if cd:
+                        target_names[cid] = cd.get("name", "Untitled")
+
+    # Read source data and write copies
+    read_cdb = db.CursorDB(global_db_path)
+    write_cdb = db.CursorDB(global_db_path)
+    try:
+        for old_id in composer_ids:
+            composer_data = read_cdb.get_json(f"composerData:{old_id}")
+            if not composer_data:
+                print(f"  {old_id[:12]}... not found in global DB", file=sys.stderr)
+                failure += 1
+                continue
+
+            name = composer_data.get("name", "Untitled")
+
+            # Check for same-name conflict in target
+            existing_same_name = [n for n in target_names.values() if n == name]
+            if existing_same_name:
+                print(f"  Note: target already has a chat named \"{name}\"")
+
+            # Deep copy: new ID, rewrite paths, duplicate all data
+            new_id = str(uuid.uuid4())
+
+            # Copy and transform composerData
+            new_data = json.loads(json.dumps(composer_data))
+            new_data["composerId"] = new_id
+            if needs_rewrite:
+                new_data = rewrite_paths(new_data, source_norm, target_norm)
+            write_cdb.write_json(f"composerData:{new_id}", new_data)
+
+            # Copy bubble entries
+            bubble_keys = read_cdb.list_keys(f"bubbleId:{old_id}:")
+            if bubble_keys:
+                bubble_items = []
+                for key in bubble_keys:
+                    bubble_id = key[len(f"bubbleId:{old_id}:"):]
+                    val = read_cdb.get_json(key)
+                    if val:
+                        if needs_rewrite:
+                            val = rewrite_paths(val, source_norm, target_norm)
+                        bubble_items.append((f"bubbleId:{new_id}:{bubble_id}", val))
+                if bubble_items:
+                    write_cdb.write_json_batch(bubble_items)
+
+            # Copy message contexts
+            ctx_keys = read_cdb.list_keys(f"messageRequestContext:{old_id}:")
+            if ctx_keys:
+                ctx_items = []
+                for key in ctx_keys:
+                    msg_key = key[len(f"messageRequestContext:{old_id}:"):]
+                    val = read_cdb.get_json(key)
+                    if val:
+                        ctx_items.append((f"messageRequestContext:{new_id}:{msg_key}", val))
+                if ctx_items:
+                    write_cdb.write_json_batch(ctx_items)
+
+            # Copy checkpoint data
+            cp_keys = read_cdb.list_keys(f"checkpointId:{old_id}:")
+            if cp_keys:
+                cp_items = []
+                for key in cp_keys:
+                    cp_id = key[len(f"checkpointId:{old_id}:"):]
+                    val = read_cdb.get_json(key)
+                    if val:
+                        if needs_rewrite:
+                            val = rewrite_paths(val, source_norm, target_norm)
+                        cp_items.append((f"checkpointId:{new_id}:{cp_id}", val))
+                if cp_items:
+                    write_cdb.write_json_batch(cp_items)
+
+            # Register in target workspace
+            if _register_in_workspace(new_id, new_data, target_ws_dir):
+                if needs_rewrite:
+                    print(f"  Copied: {name} (paths rewritten)")
+                else:
+                    print(f"  Copied: {name}")
+                target_names[new_id] = name
+                success += 1
+            else:
+                print(f"  Failed: {name}", file=sys.stderr)
+                failure += 1
+    finally:
+        read_cdb.close()
+        write_cdb.close()
+
+    return success, failure
+
+
+# ── Blob repair ──────────────────────────────────────────────────────────
+
+
+def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
+    """Scan all conversations for missing agentKv blobs and backfill from snapshots.
+
+    Returns (conversations_repaired, blobs_restored).
+    """
+    import base64
+    from .export import _extract_agent_blob_ids
+
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        return 0, 0
+
+    snapshots_dir = paths.get_snapshots_dir()
+    if not snapshots_dir.exists():
+        return 0, 0
+
+    # Phase 1: Find conversations with missing blobs
+    missing_map: dict[str, set[str]] = {}  # composerId -> set of missing blob hex IDs
+
+    with db.CursorDB(global_db_path) as cdb:
+        all_keys = cdb.list_keys("composerData:")
+        for key in all_keys:
+            cd = cdb.get_json(key)
+            if not cd:
+                continue
+            refs = _extract_agent_blob_ids(cd)
+            if not refs:
+                continue
+
+            missing = set()
+            for bid in refs:
+                val = cdb.get_item_binary(f"agentKv:blob:{bid}", table="cursorDiskKV")
+                if val is None:
+                    missing.add(bid)
+
+            if missing:
+                cid = key.split(":", 1)[1]
+                missing_map[cid] = missing
+
+    if not missing_map:
+        if verbose:
+            print("  No conversations with missing blobs.")
+        return 0, 0
+
+    all_missing_ids = set()
+    for s in missing_map.values():
+        all_missing_ids |= s
+
+    if verbose:
+        print(f"  {len(missing_map)} conversation(s) with {len(all_missing_ids)} unique missing blob(s)")
+
+    # Phase 2: Scan snapshots that contain agentBlobs (version >= 3).
+    # Only decompress snapshots that might contain the missing blobs.
+    restored_blobs: dict[str, bytes] = {}
+
+    for project_dir in snapshots_dir.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for sf in list_snapshot_files(project_dir):
+            if not all_missing_ids - set(restored_blobs.keys()):
+                break
+
+            meta = read_snapshot_meta(sf)
+            if meta.get("version", 1) < 3:
+                continue
+
+            if verbose:
+                print(f"  Scanning: {sf.name}")
+
+            try:
+                snap = read_snapshot_file(sf)
+            except Exception:
+                continue
+
+            snap_blobs = snap.get("agentBlobs", {})
+            if not snap_blobs:
+                continue
+
+            found_any = False
+            for bid, b64val in snap_blobs.items():
+                if bid in all_missing_ids and bid not in restored_blobs:
+                    try:
+                        restored_blobs[bid] = base64.b64decode(b64val)
+                        found_any = True
+                    except Exception:
+                        pass
+
+            if found_any and verbose:
+                count = sum(1 for b in snap_blobs if b in all_missing_ids)
+                print(f"    Found {count} matching blob(s)")
+
+        if not all_missing_ids - set(restored_blobs.keys()):
+            break
+
+    if not restored_blobs:
+        if verbose:
+            still_missing = len(all_missing_ids)
+            print(f"  No matching blobs found in snapshots ({still_missing} still missing)")
+        return 0, 0
+
+    # Phase 3: Write restored blobs to the global DB
+    backup_path = db.backup_db(global_db_path)
+    if verbose:
+        print(f"  Backed up global DB to {backup_path.name}")
+
+    with db.CursorDB(global_db_path) as cdb:
+        cdb.write_batch([
+            (f"agentKv:blob:{bid}", val)
+            for bid, val in restored_blobs.items()
+        ])
+
+    conversations_fixed = 0
+    for cid, missing in missing_map.items():
+        if missing & set(restored_blobs.keys()):
+            conversations_fixed += 1
+
+    remaining = len(all_missing_ids) - len(restored_blobs)
+    if verbose and remaining > 0:
+        print(f"  {remaining} blob(s) not found in any snapshot (from conversations not yet pushed)")
+
+    return conversations_fixed, len(restored_blobs)
+
+
+# ── Doctor: audit and recover orphaned chats ─────────────────────────
+
+
+def doctor_audit() -> dict:
+    """Audit all chats in the global DB against workspace registrations.
+
+    Returns a dict with:
+      storage: dict with size info
+      total: total composerData entries
+      registered: count registered in at least one workspace
+      orphaned: list of dicts for orphaned chats with content
+      empty: count of empty/stub chats
+      workspaces: list of workspace summary dicts
+    """
+    global_db_path = paths.get_global_db_path()
+    ws_storage = paths.get_workspace_storage_dir()
+
+    # --- Storage info ---
+    storage = {}
+    gdb_stat = global_db_path.stat()
+    storage["global_db_mb"] = gdb_stat.st_size / (1024 * 1024)
+    wal_path = global_db_path.parent / (global_db_path.name + "-wal")
+    if wal_path.exists():
+        storage["wal_mb"] = wal_path.stat().st_size / (1024 * 1024)
+    ws_total = sum(
+        f.stat().st_size for f in ws_storage.rglob("*") if f.is_file()
+    ) if ws_storage.exists() else 0
+    storage["workspace_storage_mb"] = ws_total / (1024 * 1024)
+
+    # --- Build registration map from all workspaces ---
+    # Supports both Cursor 2.x (allComposers) and 3.0+ (selectedComposerIds
+    # + composerChatViewPane) schemas.
+    registered_ids: dict[str, list[dict]] = {}  # composerId -> [workspace info]
+    workspace_summaries = []
+
+    all_ws = paths.list_all_workspaces()
+    for ws in all_ws:
+        ws_db_path = ws["workspace_dir"] / "state.vscdb"
+        if not ws_db_path.exists():
+            continue
+
+        ws_composer_ids = paths.get_workspace_composer_ids(ws_db_path)
+        if not ws_composer_ids:
+            continue
+
+        ws_label = os.path.basename(ws["path"])
+        if ws["host"]:
+            ws_label += f" ({ws['host']})"
+
+        workspace_summaries.append({
+            "label": ws_label,
+            "path": ws["path"],
+            "host": ws.get("host"),
+            "workspace_dir": ws["workspace_dir"],
+            "chat_count": len(ws_composer_ids),
+        })
+
+        for cid in ws_composer_ids:
+            if cid not in registered_ids:
+                registered_ids[cid] = []
+            registered_ids[cid].append({
+                "label": ws_label,
+                "workspace_dir": ws["workspace_dir"],
+            })
+
+    # --- Build workspace-by-path map for orphan matching ---
+    ws_by_path: dict[str, list[dict]] = {}
+    for ws in all_ws:
+        p = ws["path"]
+        if p not in ws_by_path:
+            ws_by_path[p] = []
+        ws_by_path[p].append(ws)
+
+    # --- Scan global DB ---
+    orphaned = []
+    registered_count = 0
+    empty_count = 0
+
+    with db.CursorDB(global_db_path) as cdb:
+        all_keys = cdb.list_keys("composerData:")
+        for key in all_keys:
+            cid = key.split(":", 1)[1]
+            cd = cdb.get_json(key)
+            if not cd:
+                continue
+
+            name = cd.get("name") or ""
+            msgs = len(cd.get("fullConversationHeadersOnly", []))
+
+            if cid in registered_ids:
+                registered_count += 1
+            elif msgs == 0 and not name:
+                empty_count += 1
+            else:
+                best_ws = _find_best_workspace(cid, cd, cdb, ws_by_path)
+                ws_label = None
+                if best_ws:
+                    ws_label = os.path.basename(best_ws["path"])
+                    if best_ws.get("host"):
+                        ws_label += f" ({best_ws['host']})"
+
+                orphaned.append({
+                    "composerId": cid,
+                    "name": name or "Untitled",
+                    "messageCount": msgs,
+                    "createdAt": cd.get("createdAt", 0),
+                    "lastUpdatedAt": cd.get("lastUpdatedAt", 0),
+                    "likelyWorkspace": ws_label,
+                })
+
+    orphaned.sort(key=lambda x: x["messageCount"], reverse=True)
+
+    return {
+        "storage": storage,
+        "total": len(all_keys),
+        "registered": registered_count,
+        "orphaned": orphaned,
+        "empty": empty_count,
+        "workspaces": workspace_summaries,
+    }
+
+
+def doctor_recover(
+    composer_ids: Optional[list[str]] = None,
+    force: bool = False,
+) -> tuple[int, int]:
+    """Re-register orphaned chats in the most appropriate workspace.
+
+    For each orphaned chat, finds the best workspace by scanning all
+    workspaces for matching project paths (using bubble entry file
+    references and composerData context).
+
+    Args:
+        composer_ids: Specific IDs to recover, or None for all orphaned.
+        force: Skip the Cursor-running check.
+
+    Returns (recovered, failed).
+    """
+    if not force and is_cursor_running():
+        print(
+            "WARNING: Cursor is running. Close Cursor FIRST (Cmd+Q / quit),\n"
+            "then run this command, then reopen Cursor.\n"
+            "Use --force to override (not recommended).\n",
+            file=sys.stderr,
+        )
+        return 0, 0
+
+    global_db_path = paths.get_global_db_path()
+    all_ws = paths.list_all_workspaces()
+
+    # Build map: workspace path -> best workspace dir (newest first, already sorted)
+    ws_by_path: dict[str, list[dict]] = {}
+    for ws in all_ws:
+        p = ws["path"]
+        if p not in ws_by_path:
+            ws_by_path[p] = []
+        ws_by_path[p].append(ws)
+
+    # Get the audit to find orphaned chats
+    audit = doctor_audit()
+    orphaned = audit["orphaned"]
+    if composer_ids:
+        orphaned = [o for o in orphaned if o["composerId"] in composer_ids]
+
+    if not orphaned:
+        print("No orphaned chats to recover.")
+        return 0, 0
+
+    recovered = 0
+    failed = 0
+
+    with db.CursorDB(global_db_path) as cdb:
+        for chat in orphaned:
+            cid = chat["composerId"]
+            cd = cdb.get_json(f"composerData:{cid}")
+            if not cd:
+                failed += 1
+                continue
+
+            name = chat["name"]
+            target_ws = _find_best_workspace(cid, cd, cdb, ws_by_path)
+
+            if not target_ws:
+                print(f"  No workspace found for: \"{name}\" ({cid[:12]}...)")
+                failed += 1
+                continue
+
+            ws_dir = target_ws["workspace_dir"]
+            ws_label = os.path.basename(target_ws["path"])
+            if target_ws.get("host"):
+                ws_label += f" ({target_ws['host']})"
+
+            if _register_in_workspace(cid, cd, ws_dir):
+                print(f"  Recovered: \"{name}\" → {ws_label}")
+                recovered += 1
+            else:
+                print(f"  Failed: \"{name}\"")
+                failed += 1
+
+    return recovered, failed
+
+
+def _find_best_workspace(
+    composer_id: str,
+    composer_data: dict,
+    cdb: "db.CursorDB",
+    ws_by_path: dict[str, list[dict]],
+) -> Optional[dict]:
+    """Find the best workspace to register an orphaned chat in.
+
+    Strategy:
+    1. Check bubble entries for file paths that match a workspace
+    2. Check composerData context for workspace path hints
+    3. Check selectedComposerIds in workspace DBs (ghost references)
+    """
+    # Strategy 1: scan a few bubble entries for file paths
+    bubble_keys = cdb.list_keys(f"bubbleId:{composer_id}:")
+    file_paths_seen: dict[str, int] = {}  # workspace path -> count
+
+    for key in bubble_keys[:20]:
+        val = cdb.get_item(key, table="cursorDiskKV")
+        if not val:
+            continue
+        for ws_path in ws_by_path:
+            if ws_path in val and len(ws_path) > 5:
+                file_paths_seen[ws_path] = file_paths_seen.get(ws_path, 0) + 1
+
+    if file_paths_seen:
+        best_path = max(file_paths_seen, key=file_paths_seen.get)
+        return ws_by_path[best_path][0]
+
+    # Strategy 2: check composerData for path references
+    cd_str = json.dumps(composer_data)
+    for ws_path in ws_by_path:
+        if ws_path in cd_str and len(ws_path) > 5:
+            return ws_by_path[ws_path][0]
+
+    # Strategy 3: check workspace DBs for ghost selectedComposerIds
+    for ws_path, ws_list in ws_by_path.items():
+        for ws in ws_list:
+            ws_db_path = ws["workspace_dir"] / "state.vscdb"
+            if not ws_db_path.exists():
+                continue
+            try:
+                with db.CursorDB(ws_db_path) as ws_cdb:
+                    data = ws_cdb.get_json("composer.composerData", table="ItemTable")
+                    if data:
+                        selected = data.get("selectedComposerIds", [])
+                        if composer_id in selected:
+                            return ws
+            except Exception:
+                continue
+
+    return None
+
+
+# ── Migration ─────────────────────────────────────────────────────────
+
+
+def migrate_to_global_headers(
+    dry_run: bool = False,
+    force: bool = False,
+) -> tuple[int, int]:
+    """Migrate old chats into the Cursor 3.0 global composer.composerHeaders index.
+
+    Scans all workspaces for chats that exist in the old format (allComposers,
+    pane entries, selectedComposerIds) but are missing from the central
+    composer.composerHeaders index. Adds them with the correct
+    workspaceIdentifier so Cursor 3.0 can discover them natively.
+
+    Args:
+        dry_run: If True, only report what would be migrated without writing.
+        force: Skip the Cursor-running check.
+
+    Returns (migrated_count, already_present_count).
+    """
+    if not dry_run and not force and is_cursor_running():
+        print(
+            "WARNING: Cursor is running. Close Cursor FIRST (Cmd+Q / quit),\n"
+            "then run this command, then reopen Cursor.\n"
+            "Use --force to override (not recommended).\n",
+            file=sys.stderr,
+        )
+        return 0, 0
+
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        print("Global DB not found.", file=sys.stderr)
+        return 0, 0
+
+    # Read the current global headers
+    global_cdb = db.CursorDB(global_db_path)
+    try:
+        headers = global_cdb.get_json("composer.composerHeaders", table="ItemTable")
+    finally:
+        global_cdb.close()
+    if headers is None:
+        headers = {"allComposers": []}
+
+    existing_ids = {
+        c.get("composerId") for c in headers.get("allComposers", [])
+    }
+
+    # Scan all workspaces for chats not in the global index
+    all_ws = paths.list_all_workspaces()
+    to_migrate: list[tuple] = []  # (entry_or_None, cid, ws_dir, ws_identifier)
+    already_present = 0
+
+    for ws in all_ws:
+        ws_dir = ws["workspace_dir"]
+        ws_db_path = ws_dir / "state.vscdb"
+        if not ws_db_path.exists():
+            continue
+
+        local_ids: set[str] = set()
+        local_metadata: dict[str, dict] = {}
+
+        try:
+            with db.CursorDB(ws_db_path) as cdb:
+                data = cdb.get_json("composer.composerData", table="ItemTable")
+                if not data:
+                    continue
+
+                for c in data.get("allComposers", []):
+                    cid = c.get("composerId")
+                    if cid:
+                        local_ids.add(cid)
+                        local_metadata[cid] = c
+
+                for cid in data.get("selectedComposerIds", []):
+                    if cid:
+                        local_ids.add(cid)
+                for cid in data.get("lastFocusedComposerIds", []):
+                    if cid:
+                        local_ids.add(cid)
+
+                for key in cdb.list_keys(
+                    "workbench.panel.composerChatViewPane.", table="ItemTable"
+                ):
+                    pane = cdb.get_json(key, table="ItemTable")
+                    if isinstance(pane, dict):
+                        for view_key in pane:
+                            if ".view." in view_key:
+                                cid = view_key.rsplit(".", 1)[-1]
+                                if cid:
+                                    local_ids.add(cid)
+        except Exception:
+            continue
+
+        ws_identifier = _build_workspace_identifier(ws_dir)
+        for cid in local_ids:
+            if cid in existing_ids:
+                already_present += 1
+                continue
+
+            entry = None
+            if cid in local_metadata:
+                entry = _build_composer_header_entry(cid, local_metadata[cid])
+
+            to_migrate.append((entry, cid, ws_dir, ws_identifier))
+            existing_ids.add(cid)
+
+    if not to_migrate:
+        print(f"All chats already in global index ({already_present} checked).")
+        return 0, already_present
+
+    # Fetch metadata from global DB for entries that need it, skip empty stubs
+    final_entries: list[dict] = []
+    with db.CursorDB(global_db_path) as read_cdb:
+        for entry, cid, ws_dir, ws_identifier in to_migrate:
+            if entry is None:
+                cd = read_cdb.get_json(f"composerData:{cid}")
+                if not cd:
+                    continue
+                msgs = len(cd.get("fullConversationHeadersOnly", []))
+                if msgs == 0 and not cd.get("name"):
+                    continue
+                entry = _build_composer_header_entry(cid, cd)
+
+            entry["workspaceIdentifier"] = ws_identifier
+
+            ws_label = os.path.basename(
+                ws_identifier.get("uri", {}).get("fsPath", ws_dir.name)
+            )
+            name = entry.get("name", "")[:40] or "(unnamed)"
+
+            if dry_run:
+                print(f"  Would migrate: {cid[:12]}... \"{name}\" → {ws_label}")
+
+            final_entries.append(entry)
+
+    if not final_entries:
+        print(f"No chats to migrate ({already_present} already present).")
+        return 0, already_present
+
+    if dry_run:
+        print(f"\n{len(final_entries)} chat(s) would be migrated "
+              f"({already_present} already present).")
+        return len(final_entries), already_present
+
+    backup_path = db.backup_db(global_db_path)
+    print(f"Backed up global DB to {backup_path.name}")
+
+    headers["allComposers"].extend(final_entries)
+    write_cdb = db.CursorDB(global_db_path)
+    try:
+        write_cdb.write_json("composer.composerHeaders", headers, table="ItemTable")
+    finally:
+        write_cdb.close()
+    paths.invalidate_headers_cache()
+
+    print(f"Migrated {len(final_entries)} chat(s) to global index.")
+    print("Restart Cursor to see them in the sidebar.")
+    return len(final_entries), already_present
+
+
+# ── Purge ─────────────────────────────────────────────────────────────
+
+
+def list_all_chats_with_sizes() -> list[dict]:
+    """List every chat in Cursor's global DB with approximate size info.
+
+    Returns a list of dicts with:
+      composerId, name, messageCount, keyCount, workspace_label, workspace_dir
+    Sorted by keyCount descending (largest first).
+    """
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        return []
+
+    # Build workspace mapping from global headers + old allComposers
+    headers_map = paths._build_global_headers_map()
+    ws_by_hash: dict[str, dict] = {}
+    for ws in paths.list_all_workspaces():
+        ws_by_hash[ws["workspace_dir"].name] = ws
+
+    # Map composerId -> workspace label using global headers
+    cid_to_ws: dict[str, str] = {}
+    cid_to_ws_dir: dict[str, str] = {}
+    for ws_hash, entries in headers_map.items():
+        ws = ws_by_hash.get(ws_hash)
+        if ws:
+            label = os.path.basename(ws["path"])
+            host = ws.get("host")
+            if host:
+                label += f" ({host})"
+        else:
+            label = ws_hash[:12]
+        for e in entries:
+            cid = e.get("composerId", "")
+            cid_to_ws[cid] = label
+            if ws:
+                cid_to_ws_dir[cid] = str(ws["workspace_dir"])
+
+    # Also build from old allComposers in workspace DBs
+    for ws in ws_by_hash.values():
+        ws_db = ws["workspace_dir"] / "state.vscdb"
+        if not ws_db.exists():
+            continue
+        try:
+            with db.CursorDB(ws_db) as cdb:
+                data = cdb.get_json("composer.composerData", table="ItemTable")
+                if data:
+                    for c in data.get("allComposers", []):
+                        cid = c.get("composerId", "")
+                        if cid and cid not in cid_to_ws:
+                            label = os.path.basename(ws["path"])
+                            host = ws.get("host")
+                            if host:
+                                label += f" ({host})"
+                            cid_to_ws[cid] = label
+                            cid_to_ws_dir[cid] = str(ws["workspace_dir"])
+        except Exception:
+            continue
+
+    # Scan global DB for all chats — use efficient grouped counting
+    results = []
+    with db.CursorDB(global_db_path) as gcdb:
+        # Two efficient grouped queries instead of N individual ones
+        print("  Counting bubble entries...")
+        bubble_counts = gcdb.count_keys_by_chat_prefix("bubbleId")
+        print("  Counting checkpoint entries...")
+        checkpoint_counts = gcdb.count_keys_by_chat_prefix("checkpointId")
+
+        print("  Reading chat metadata...")
+        all_cd_keys = gcdb.list_keys("composerData:")
+
+        for key in all_cd_keys:
+            cid = key.split(":", 1)[1]
+            cd = gcdb.get_json(key)
+            if not cd:
+                continue
+            msgs = len(cd.get("fullConversationHeadersOnly", []))
+            name = cd.get("name", "")
+            bubble_count = bubble_counts.get(cid, 0)
+            checkpoint_count = checkpoint_counts.get(cid, 0)
+            key_count = 1 + bubble_count + checkpoint_count
+
+            results.append({
+                "composerId": cid,
+                "name": name,
+                "messageCount": msgs,
+                "keyCount": key_count,
+                "bubbleCount": bubble_count,
+                "checkpointCount": checkpoint_count,
+                "workspace_label": cid_to_ws.get(cid, "unknown"),
+                "workspace_dir": cid_to_ws_dir.get(cid, ""),
+            })
+
+    results.sort(key=lambda x: x["keyCount"], reverse=True)
+    return results
+
+
+def purge_chats(
+    composer_ids: list[str],
+    force: bool = False,
+) -> tuple[int, int]:
+    """Delete chats and all their data from Cursor's databases.
+
+    Removes from the global DB: composerData, bubbleId, checkpointId,
+    and messageRequestContext entries. Also removes from
+    composer.composerHeaders (3.0+) and workspace allComposers (2.x).
+
+    Args:
+        composer_ids: List of composer IDs to delete.
+        force: Skip the Cursor-running check.
+
+    Returns (deleted_count, keys_removed).
+    """
+    if not force and is_cursor_running():
+        print(
+            "WARNING: Cursor is running. Close Cursor FIRST (Cmd+Q / quit),\n"
+            "then run this command, then reopen Cursor.\n"
+            "Use --force to override (not recommended).\n",
+            file=sys.stderr,
+        )
+        return 0, 0
+
+    if not composer_ids:
+        return 0, 0
+
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        return 0, 0
+
+    backup_path = db.backup_db(global_db_path)
+    print(f"  Backed up global DB to {backup_path.name}")
+
+    cid_set = set(composer_ids)
+    total_keys = 0
+
+    # Delete from global DB (cursorDiskKV)
+    write_cdb = db.CursorDB(global_db_path)
+    try:
+        for cid in composer_ids:
+            keys_deleted = 0
+            keys_deleted += write_cdb.delete_keys([f"composerData:{cid}"])
+            keys_deleted += write_cdb.delete_keys_by_prefix(f"bubbleId:{cid}:")
+            keys_deleted += write_cdb.delete_keys_by_prefix(f"checkpointId:{cid}:")
+            keys_deleted += write_cdb.delete_keys_by_prefix(f"messageRequestContext:{cid}:")
+            total_keys += keys_deleted
+
+        # Remove from composer.composerHeaders (global DB, ItemTable)
+        headers = write_cdb.get_json("composer.composerHeaders", table="ItemTable")
+        if headers and "allComposers" in headers:
+            before = len(headers["allComposers"])
+            headers["allComposers"] = [
+                c for c in headers["allComposers"]
+                if c.get("composerId") not in cid_set
+            ]
+            if len(headers["allComposers"]) < before:
+                write_cdb.write_json(
+                    "composer.composerHeaders", headers, table="ItemTable"
+                )
+    finally:
+        write_cdb.close()
+
+    paths.invalidate_headers_cache()
+
+    # Remove from workspace DBs (allComposers + selectedComposerIds)
+    for ws in paths.list_all_workspaces():
+        ws_db_path = ws["workspace_dir"] / "state.vscdb"
+        if not ws_db_path.exists():
+            continue
+        try:
+            ws_cdb = db.CursorDB(ws_db_path)
+            try:
+                data = ws_cdb.get_json("composer.composerData", table="ItemTable")
+                if not data:
+                    continue
+                changed = False
+
+                if "allComposers" in data:
+                    before = len(data["allComposers"])
+                    data["allComposers"] = [
+                        c for c in data["allComposers"]
+                        if c.get("composerId") not in cid_set
+                    ]
+                    if len(data["allComposers"]) < before:
+                        changed = True
+
+                for list_key in ("selectedComposerIds", "lastFocusedComposerIds"):
+                    if list_key in data:
+                        before = len(data[list_key])
+                        data[list_key] = [
+                            c for c in data[list_key] if c not in cid_set
+                        ]
+                        if len(data[list_key]) < before:
+                            changed = True
+
+                if changed:
+                    ws_cdb.write_json(
+                        "composer.composerData", data, table="ItemTable"
+                    )
+            finally:
+                ws_cdb.close()
+        except Exception:
+            continue
+
+    return len(composer_ids), total_keys
