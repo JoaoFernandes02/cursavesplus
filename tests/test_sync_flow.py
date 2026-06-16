@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 from cursor_saves import paths, profile
-from cursor_saves.backends import GitBackend, load_config, save_config
+from cursor_saves.backends import GitBackend, apply_git_identity, load_config, save_config, save_git_config
 from cursor_saves.importer import (
     format_sync_status,
     get_push_status_for_conversation,
@@ -166,6 +166,60 @@ class GitBackendSyncTests(TempEnvMixin, unittest.TestCase):
         self.assertTrue((self.sync_dir / "snapshots").is_dir())
         self.assertTrue((self.sync_dir / "profile").is_dir())
         self.assertTrue((self.sync_dir / ".git").exists())
+
+    def test_apply_git_identity_sets_local_config(self):
+        save_git_config(
+            name="Sync User",
+            email="sync@example.com",
+            sign_commits=False,
+        )
+        backend = GitBackend(self.sync_dir)
+        backend.init_repo()
+
+        def git_local(key: str) -> str | None:
+            result = subprocess.run(
+                ["git", "config", "--local", key],
+                cwd=self.sync_dir,
+                capture_output=True,
+                text=True,
+            )
+            return result.stdout.strip() if result.returncode == 0 else None
+
+        self.assertEqual(git_local("user.name"), "Sync User")
+        self.assertEqual(git_local("user.email"), "sync@example.com")
+        self.assertEqual(git_local("commit.gpgsign"), "false")
+
+        (self.sync_dir / "snapshots" / "proj").mkdir(parents=True)
+        (self.sync_dir / "snapshots" / "proj" / "abc.meta.json").write_text('{"composerId":"abc"}')
+        self.assertTrue(backend.push(paths.get_snapshots_dir()))
+
+        log = subprocess.run(
+            ["git", "log", "-1", "--format=%an|%ae"],
+            cwd=self.sync_dir,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(log.stdout.strip(), "Sync User|sync@example.com")
+
+    def test_apply_git_identity_disables_global_gpgsign(self):
+        save_git_config(
+            name="Sync User",
+            email="sync@example.com",
+            sign_commits=False,
+        )
+        backend = GitBackend(self.sync_dir)
+        backend.init_repo()
+        apply_git_identity(self.sync_dir)
+
+        result = subprocess.run(
+            ["git", "config", "--local", "commit.gpgsign"],
+            cwd=self.sync_dir,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(result.stdout.strip(), "false")
 
     def test_push_includes_profile_and_snapshots(self):
         bare = self._init_git_with_remote()

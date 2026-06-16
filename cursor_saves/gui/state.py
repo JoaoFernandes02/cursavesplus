@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from .. import paths, profile
-from ..backends import get_backend, load_config
+from ..backends import get_backend, get_git_config, load_config
 from ..hook_install import _is_cursaves_hook, _load_hooks_json
 from ..importer import is_cursor_running, list_snapshot_projects
 from ..watch import get_watch_log_path, is_watch_running
@@ -36,6 +36,47 @@ def get_remote_url() -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def get_git_identity() -> dict:
+    """Return configured git identity for sync commits."""
+    git_cfg = get_git_config()
+    if git_cfg.get("name") or git_cfg.get("email"):
+        return git_cfg
+
+    sync_dir = paths.get_sync_dir()
+    if not (sync_dir / ".git").exists():
+        return git_cfg
+
+    identity = dict(git_cfg)
+    for key, field in (("user.name", "name"), ("user.email", "email")):
+        try:
+            result = subprocess.run(
+                ["git", "config", "--local", key],
+                capture_output=True,
+                text=True,
+                cwd=str(sync_dir),
+            )
+            if result.returncode == 0:
+                value = result.stdout.strip()
+                if value and not identity.get(field):
+                    identity[field] = value
+        except Exception:
+            pass
+
+    try:
+        result = subprocess.run(
+            ["git", "config", "--local", "commit.gpgsign"],
+            capture_output=True,
+            text=True,
+            cwd=str(sync_dir),
+        )
+        if result.returncode == 0:
+            identity["sign_commits"] = result.stdout.strip().lower() in ("true", "1", "yes")
+    except Exception:
+        pass
+
+    return identity
 
 
 def hook_is_installed() -> bool:

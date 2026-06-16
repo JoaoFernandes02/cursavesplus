@@ -11,7 +11,18 @@ from pathlib import Path
 from typing import Optional
 
 from . import __version__, db, export, paths, profile, setup_wizard
-from .backends import GitBackend, S3Backend, SyncBackend, get_backend, load_config, save_config
+from .backends import (
+    GitBackend,
+    S3Backend,
+    SyncBackend,
+    apply_git_identity,
+    get_backend,
+    get_git_config,
+    load_config,
+    read_global_git_identity,
+    save_config,
+    save_git_config,
+)
 from .importer import (
     copy_between_workspaces,
     doctor_audit,
@@ -337,9 +348,13 @@ def cmd_init(args):
         if args.remote:
             git_backend.update_remote(args.remote)
             print(f"  Remote updated: {args.remote}")
+        _save_git_identity_from_args(args)
+        if paths.is_sync_repo_initialized():
+            apply_git_identity(sync_dir)
         return
 
     print(f"Initializing sync repo at {sync_dir}...")
+    _save_git_identity_from_args(args)
     git_backend = GitBackend(sync_dir)
     git_backend.init_repo(remote=args.remote)
     _ensure_profile_config()
@@ -964,6 +979,72 @@ def _ensure_profile_config() -> None:
             "categories": dict(profile.DEFAULT_CATEGORIES),
         }
         save_config(config)
+
+
+def _save_git_identity_from_args(args) -> None:
+    """Save git identity from CLI flags if provided."""
+    git_name = getattr(args, "git_name", None)
+    git_email = getattr(args, "git_email", None)
+    sign_commits = getattr(args, "git_sign", None)
+
+    if git_name is None and git_email is None and sign_commits is None:
+        return
+
+    current = get_git_config()
+    save_git_config(
+        name=git_name if git_name is not None else current.get("name"),
+        email=git_email if git_email is not None else current.get("email"),
+        sign_commits=sign_commits if sign_commits is not None else current.get("sign_commits", False),
+    )
+
+
+def cmd_config_git(args):
+    """Configure git identity for sync repo commits."""
+    if args.show:
+        git_cfg = get_git_config()
+        print("Git identity for sync commits (~/.cursaves/):")
+        print(f"  Name:  {git_cfg.get('name') or '(not set)'}")
+        print(f"  Email: {git_cfg.get('email') or '(not set)'}")
+        print(f"  Sign commits (GPG): {'yes' if git_cfg.get('sign_commits') else 'no'}")
+        global_id = read_global_git_identity()
+        if global_id.get("name") or global_id.get("email"):
+            print("\nGlobal git identity (for reference):")
+            print(f"  Name:  {global_id.get('name') or '(not set)'}")
+            print(f"  Email: {global_id.get('email') or '(not set)'}")
+        return
+
+    if not args.name and not args.email and args.sign is None and not args.no_sign:
+        print(
+            "Error: specify --name, --email, --sign, --no-sign, or --show.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    current = get_git_config()
+    if args.no_sign:
+        sign_commits = False
+    elif args.sign is not None:
+        sign_commits = True
+    else:
+        sign_commits = current.get("sign_commits", False)
+    git_cfg = save_git_config(
+        name=args.name if args.name else current.get("name"),
+        email=args.email if args.email else current.get("email"),
+        sign_commits=sign_commits,
+    )
+    print("Git identity saved for sync commits:")
+    print(f"  Name:  {git_cfg.get('name') or '(not set)'}")
+    print(f"  Email: {git_cfg.get('email') or '(not set)'}")
+    print(f"  Sign commits (GPG): {'yes' if git_cfg.get('sign_commits') else 'no'}")
+
+
+def cmd_config(args):
+    """Configuration subcommands."""
+    if args.config_command == "git":
+        cmd_config_git(args)
+    else:
+        print("Error: unknown config command.", file=sys.stderr)
+        sys.exit(1)
 
 
 def _profile_export_push(backend: SyncBackend, snapshots_dir: Path) -> bool:
@@ -1944,6 +2025,20 @@ def main():
         "--region",
         help="AWS region for S3 bucket",
     )
+    p_init.add_argument(
+        "--git-name",
+        help="Git user.name for sync repo commits",
+    )
+    p_init.add_argument(
+        "--git-email",
+        help="Git user.email for sync repo commits",
+    )
+    p_init.add_argument(
+        "--git-sign",
+        action="store_true",
+        default=None,
+        help="Sign sync commits with GPG (default: disabled for sync repo)",
+    )
     p_init.set_defaults(func=cmd_init)
 
     # ── setup ─────────────────────────────────────────────────────
@@ -1979,7 +2074,54 @@ def main():
         "--no-watch", action="store_true",
         help="Skip auto-sync installation / instructions",
     )
+    p_setup.add_argument(
+        "--git-name",
+        help="Git user.name for sync repo commits",
+    )
+    p_setup.add_argument(
+        "--git-email",
+        help="Git user.email for sync repo commits",
+    )
+    p_setup.add_argument(
+        "--git-sign",
+        action="store_true",
+        default=None,
+        help="Sign sync commits with GPG (default: disabled for sync repo)",
+    )
     p_setup.set_defaults(func=cmd_setup)
+
+    # ── config ────────────────────────────────────────────────────
+    p_config = subparsers.add_parser("config", help="Configure cursaves settings")
+    config_sub = p_config.add_subparsers(dest="config_command")
+
+    p_config_git = config_sub.add_parser(
+        "git", help="Configure git identity for sync repo commits"
+    )
+    p_config_git.add_argument(
+        "--name",
+        help="Git user.name for sync commits",
+    )
+    p_config_git.add_argument(
+        "--email",
+        help="Git user.email for sync commits",
+    )
+    p_config_git.add_argument(
+        "--sign",
+        action="store_true",
+        default=None,
+        help="Enable GPG signing for sync commits",
+    )
+    p_config_git.add_argument(
+        "--no-sign",
+        action="store_true",
+        help="Disable GPG signing for sync commits",
+    )
+    p_config_git.add_argument(
+        "--show",
+        action="store_true",
+        help="Show current git identity settings",
+    )
+    p_config_git.set_defaults(func=cmd_config)
 
     # ── workspaces ─────────────────────────────────────────────────
     p_workspaces = subparsers.add_parser(

@@ -15,7 +15,14 @@ from typing import Optional
 from InquirerPy import inquirer
 
 from . import paths, profile
-from .backends import GitBackend, S3Backend, load_config, save_config
+from .backends import (
+    GitBackend,
+    S3Backend,
+    load_config,
+    read_global_git_identity,
+    save_config,
+    save_git_config,
+)
 from .interactive import confirm, select_one
 
 
@@ -30,6 +37,9 @@ class SetupOptions:
     initial_sync: bool = True
     auto_watch: bool = True
     init_action: str = "init"  # init | update_remote | skip
+    git_name: Optional[str] = None
+    git_email: Optional[str] = None
+    git_sign_commits: bool = False
 
 
 def _cursor_user_dir_path() -> Optional[Path]:
@@ -142,6 +152,60 @@ def _prompt_existing_action() -> Optional[str]:
     return choice if isinstance(choice, str) else None
 
 
+def _prompt_git_identity(options: SetupOptions, args) -> bool:
+    """Collect git commit identity for the sync repo. Returns False if cancelled."""
+    if getattr(args, "git_name", None):
+        options.git_name = args.git_name
+    if getattr(args, "git_email", None):
+        options.git_email = args.git_email
+    if getattr(args, "git_sign", None) is not None:
+        options.git_sign_commits = bool(args.git_sign)
+
+    if options.git_name and options.git_email:
+        return True
+
+    global_id = read_global_git_identity()
+    use_defaults = getattr(args, "yes", False)
+
+    if use_defaults:
+        options.git_name = global_id.get("name")
+        options.git_email = global_id.get("email")
+        options.git_sign_commits = False
+        return True
+
+    global_label = ""
+    if global_id.get("name") or global_id.get("email"):
+        global_label = (
+            f"{global_id.get('name') or '(no name)'} "
+            f"<{global_id.get('email') or 'no email'}>"
+        )
+        if confirm(
+            f"Use your global git identity for sync commits?\n  {global_label}",
+            default=True,
+        ):
+            options.git_name = global_id.get("name")
+            options.git_email = global_id.get("email")
+            options.git_sign_commits = False
+            print("  GPG signing disabled for sync repo commits.")
+            return True
+
+    options.git_name = _prompt_text(
+        "Git user.name for sync commits:",
+        default=global_id.get("name") or "",
+    )
+    if options.git_name is None:
+        return False
+    options.git_email = _prompt_text(
+        "Git user.email for sync commits:",
+        default=global_id.get("email") or "",
+    )
+    if options.git_email is None:
+        return False
+    options.git_sign_commits = False
+    print("  GPG signing disabled for sync repo commits.")
+    return True
+
+
 def prompt_setup_options(args) -> Optional[SetupOptions]:
     """Collect setup options interactively or from CLI flags."""
     use_defaults = getattr(args, "yes", False)
@@ -189,6 +253,10 @@ def prompt_setup_options(args) -> Optional[SetupOptions]:
         elif not use_defaults:
             region = _prompt_text("AWS region (optional, press Enter to skip):", default="")
             options.region = region or None
+
+    if options.backend == "git":
+        if not _prompt_git_identity(options, args):
+            return None
 
     if paths.is_sync_repo_initialized():
         if use_defaults:
@@ -247,6 +315,18 @@ def _save_profile_config(options: SetupOptions) -> None:
     save_config(config)
 
 
+def _save_git_config(options: SetupOptions) -> None:
+    if options.backend != "git":
+        return
+    if not options.git_name and not options.git_email:
+        return
+    save_git_config(
+        name=options.git_name,
+        email=options.git_email,
+        sign_commits=options.git_sign_commits,
+    )
+
+
 def _run_init(options: SetupOptions) -> None:
     sync_dir = paths.get_sync_dir()
 
@@ -254,6 +334,7 @@ def _run_init(options: SetupOptions) -> None:
         print("\n── Init ──")
         print("  Using existing ~/.cursaves/ configuration")
         _save_profile_config(options)
+        _save_git_config(options)
         return
 
     if options.init_action == "update_remote":
@@ -265,9 +346,11 @@ def _run_init(options: SetupOptions) -> None:
         git_backend.update_remote(options.remote)
         print(f"  Updated remote: {options.remote}")
         _save_profile_config(options)
+        _save_git_config(options)
         return
 
     print("\n── Init ──")
+    _save_git_config(options)
     if options.backend == "s3":
         from .cli import cmd_init
 
@@ -323,6 +406,15 @@ def print_summary(options: SetupOptions) -> None:
     elif options.backend == "git":
         print("\nNo remote configured — local-only mode. Add later with:")
         print("  cursaves init --remote git@github.com:you/your-cursaves-data.git")
+    if options.backend == "git":
+        if options.git_name and options.git_email:
+            print(f"\nGit commit identity: {options.git_name} <{options.git_email}>")
+            print("  GPG signing: disabled for sync repo")
+        else:
+            print(
+                "\nWarning: no git identity configured for sync commits. "
+                "Run: cursaves config git --name \"...\" --email \"...\""
+            )
     print(f"Local data: {paths.get_sync_dir()}")
 
 

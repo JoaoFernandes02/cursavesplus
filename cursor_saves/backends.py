@@ -102,6 +102,8 @@ class GitBackend(SyncBackend):
         subdirs: tuple[str, ...],
         message_suffix: str = "profile + snapshots",
     ) -> bool:
+        apply_git_identity(self.sync_dir)
+
         add_args = [f"{name}/" for name in subdirs]
         subprocess.run(
             ["git", "add", *add_args],
@@ -117,10 +119,14 @@ class GitBackend(SyncBackend):
         from . import paths
         hostname = paths.get_machine_id()
         msg = f"[{hostname}] sync {message_suffix}"
-        subprocess.run(
+        commit_result = subprocess.run(
             ["git", "commit", "-m", msg],
-            cwd=str(self.sync_dir), capture_output=True,
+            cwd=str(self.sync_dir), capture_output=True, text=True,
         )
+        if commit_result.returncode != 0:
+            err = (commit_result.stderr or commit_result.stdout or "unknown error").strip()
+            print(f"  Commit failed: {err}", file=sys.stderr)
+            return False
 
         if self.has_remote():
             try:
@@ -212,6 +218,8 @@ class GitBackend(SyncBackend):
             cwd=str(self.sync_dir), capture_output=True,
         )
 
+        apply_git_identity(self.sync_dir)
+
         gitignore = self.sync_dir / ".gitignore"
         gitignore.write_text(_GITIGNORE_CONTENT)
 
@@ -219,10 +227,13 @@ class GitBackend(SyncBackend):
             ["git", "add", "."],
             cwd=str(self.sync_dir), capture_output=True,
         )
-        subprocess.run(
+        commit_result = subprocess.run(
             ["git", "commit", "-m", "Initialize cursaves sync repo"],
-            cwd=str(self.sync_dir), capture_output=True,
+            cwd=str(self.sync_dir), capture_output=True, text=True,
         )
+        if commit_result.returncode != 0:
+            err = (commit_result.stderr or commit_result.stdout or "unknown error").strip()
+            print(f"  Initial commit failed: {err}", file=sys.stderr)
 
         if remote:
             subprocess.run(
@@ -429,6 +440,84 @@ def save_config(config: dict):
     """Persist cursaves config."""
     _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     _CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n")
+
+
+def get_git_config() -> dict:
+    """Return git identity settings for sync commits (with safe defaults)."""
+    git_cfg = load_config().get("git", {})
+    return {
+        "name": git_cfg.get("name") or None,
+        "email": git_cfg.get("email") or None,
+        "sign_commits": bool(git_cfg.get("sign_commits", False)),
+    }
+
+
+def read_global_git_identity() -> dict:
+    """Read user.name and user.email from global git config."""
+    identity: dict[str, Optional[str]] = {"name": None, "email": None}
+    for key, field in (("user.name", "name"), ("user.email", "email")):
+        try:
+            result = subprocess.run(
+                ["git", "config", "--global", key],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                value = result.stdout.strip()
+                if value:
+                    identity[field] = value
+        except FileNotFoundError:
+            break
+    return identity
+
+
+def _git_config_local(sync_dir: Path, key: str, value: str) -> None:
+    subprocess.run(
+        ["git", "config", "--local", key, value],
+        cwd=str(sync_dir),
+        capture_output=True,
+    )
+
+
+def apply_git_identity(sync_dir: Path) -> None:
+    """Apply configured git identity to the sync repo (local config only)."""
+    if not (sync_dir / ".git").exists():
+        return
+
+    git_cfg = get_git_config()
+    name = git_cfg.get("name")
+    email = git_cfg.get("email")
+    if name:
+        _git_config_local(sync_dir, "user.name", name)
+    if email:
+        _git_config_local(sync_dir, "user.email", email)
+
+    sign_commits = git_cfg.get("sign_commits", False)
+    _git_config_local(sync_dir, "commit.gpgsign", "true" if sign_commits else "false")
+
+
+def save_git_config(
+    name: Optional[str] = None,
+    email: Optional[str] = None,
+    sign_commits: bool = False,
+) -> dict:
+    """Persist git identity to config.json and apply to the sync repo."""
+    from . import paths
+
+    config = load_config()
+    git_cfg = config.setdefault("git", {})
+    if name is not None:
+        git_cfg["name"] = name
+    if email is not None:
+        git_cfg["email"] = email
+    git_cfg["sign_commits"] = sign_commits
+    save_config(config)
+
+    sync_dir = paths.get_sync_dir()
+    if sync_dir.exists():
+        apply_git_identity(sync_dir)
+
+    return get_git_config()
 
 
 def get_backend() -> SyncBackend:
