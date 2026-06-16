@@ -697,14 +697,16 @@ def _select_conversations(project_path: str, prompt: str = "push", workspace_dir
     return tui_select_conversations(conversations, action=prompt)
 
 
-def _find_ahead_conversations() -> list[dict]:
-    """Scan all workspaces for conversations that are ahead of their snapshots."""
+def _find_conversations_to_push() -> list[dict]:
+    """Scan workspaces for conversations that need pushing (never_pushed or local_ahead)."""
+    from .chat_lifecycle import is_excluded
+
     workspaces = paths.list_workspaces_with_conversations()
-    ahead_items: list[dict] = []
+    push_items: list[dict] = []
 
     global_db_path = paths.get_global_db_path()
     if not global_db_path.exists():
-        return ahead_items
+        return push_items
 
     with db.CursorDB(global_db_path) as global_cdb:
         for ws in workspaces:
@@ -720,25 +722,28 @@ def _find_ahead_conversations() -> list[dict]:
             project_id = paths.get_project_identifier(ws["path"])
 
             for cid in composer_ids:
+                if is_excluded(cid):
+                    continue
                 status = get_push_status_for_conversation(cid, project_id, _cdb=global_cdb)
-                if status == "local_ahead":
-                    # Get chat name from global DB
-                    cd = global_cdb.get_json(f"composerData:{cid}")
-                    name = cd.get("name", "Untitled") if cd else "Untitled"
+                if status not in ("local_ahead", "never_pushed"):
+                    continue
+                cd = global_cdb.get_json(f"composerData:{cid}")
+                name = cd.get("name", "Untitled") if cd else "Untitled"
 
-                    ws_name = os.path.basename(os.path.normpath(ws["path"])) or ws["path"]
-                    host = ws.get("host", "")
-                    ws_label = f"{ws_name} ({host})" if host else ws_name
-                    ahead_items.append({
-                        "composerId": cid,
-                        "name": name,
-                        "workspace_label": ws_label,
-                        "workspace_dir": ws_dir,
-                        "project_path": ws["path"],
-                        "host": host,
-                    })
+                ws_name = os.path.basename(os.path.normpath(ws["path"])) or ws["path"]
+                host = ws.get("host", "")
+                ws_label = f"{ws_name} ({host})" if host else ws_name
+                push_items.append({
+                    "composerId": cid,
+                    "name": name,
+                    "workspace_label": ws_label,
+                    "workspace_dir": ws_dir,
+                    "project_path": ws["path"],
+                    "host": host,
+                    "push_status": status,
+                })
 
-    return ahead_items
+    return push_items
 
 
 def _export_and_push(sync_dir: Path, items: list[dict], backend: Optional[SyncBackend] = None) -> int:
@@ -805,35 +810,47 @@ def _push_ahead(sync_dir: Path, auto: bool = False, backend: Optional[SyncBacken
             else:
                 print(" failed (continuing with local state)", file=sys.stderr)
 
-    ahead_items = _find_ahead_conversations()
+    push_items = _find_conversations_to_push()
 
-    if not ahead_items:
+    if not push_items:
         if not auto:
             print("All synced conversations are up to date.")
         return 0
 
     if auto:
-        print(f"  Pushing {len(ahead_items)} ahead conversation(s)...")
-        for item in ahead_items:
+        never_count = sum(1 for i in push_items if i.get("push_status") == "never_pushed")
+        ahead_count = len(push_items) - never_count
+        if never_count and ahead_count:
+            print(
+                f"  Pushing {len(push_items)} conversation(s) "
+                f"({never_count} new, {ahead_count} ahead)..."
+            )
+        elif never_count:
+            print(f"  Pushing {never_count} new conversation(s)...")
+        else:
+            print(f"  Pushing {ahead_count} ahead conversation(s)...")
+        for item in push_items:
             name = item["name"]
             if len(name) > 40:
                 name = name[:37] + "..."
-            print(f"    {name} [{item['workspace_label']}]")
-        total = _export_and_push(sync_dir, ahead_items, backend=backend)
+            tag = "new" if item.get("push_status") == "never_pushed" else "ahead"
+            print(f"    {name} [{item['workspace_label']}] ({tag})")
+        total = _export_and_push(sync_dir, push_items, backend=backend)
         return total
 
-    print(f"\n  {len(ahead_items)} conversation(s) ahead of snapshots:\n")
+    print(f"\n  {len(push_items)} conversation(s) to push:\n")
     print(f"  {'#':<4} {'Name':<36} {'Workspace'}")
     print(f"  {'-' * 70}")
 
-    for i, item in enumerate(ahead_items, 1):
+    for i, item in enumerate(push_items, 1):
         name = item["name"]
         if len(name) > 34:
             name = name[:31] + "..."
         ws_label = item["workspace_label"]
         if len(ws_label) > 30:
             ws_label = ws_label[:27] + "..."
-        print(f"  {i:<4} {name:<36} {ws_label}")
+        tag = "new" if item.get("push_status") == "never_pushed" else "ahead"
+        print(f"  {i:<4} {name:<36} {ws_label} ({tag})")
 
     print(f"\n  Push these? (e.g. 1,3,5 or 1-3 or 'all') [all]:")
     try:
@@ -845,12 +862,12 @@ def _push_ahead(sync_dir: Path, auto: bool = False, backend: Optional[SyncBacken
     if not choice:
         choice = "all"
 
-    indices = _parse_selection(choice, len(ahead_items))
+    indices = _parse_selection(choice, len(push_items))
     if not indices:
         print("No conversations selected.")
         return 0
 
-    selected = [ahead_items[i - 1] for i in indices]
+    selected = [push_items[i - 1] for i in indices]
     total = _export_and_push(sync_dir, selected, backend=backend)
 
     if total == 0:
@@ -894,6 +911,8 @@ def _pull_behind(sync_dir: Path) -> int:
 
     Returns the number of snapshots successfully imported.
     """
+    from .chat_lifecycle import is_excluded
+
     projects = list_snapshot_projects()
     if not projects:
         return 0
@@ -919,6 +938,9 @@ def _pull_behind(sync_dir: Path) -> int:
                 meta = read_snapshot_meta(sf)
                 cid = meta.get("composerId")
                 if not cid:
+                    continue
+
+                if is_excluded(cid):
                     continue
 
                 # Skip snapshots we've already handled as diverged
@@ -1090,13 +1112,115 @@ def cmd_config_git(args):
     print(f"  Sign commits (GPG): {'yes' if git_cfg.get('sign_commits') else 'no'}")
 
 
+def cmd_config_sync(args):
+    """Configure sync lifecycle settings (retention, pins, exclusions)."""
+    from .chat_lifecycle import get_sync_config, save_sync_config
+
+    if args.show:
+        sync = get_sync_config()
+        print("Sync lifecycle settings (~/.config/cursaves/config.json):")
+        print(f"  retention_days:        {sync.get('retention_days')} (0 = off)")
+        print(f"  retention_purge_local: {sync.get('retention_purge_local')}")
+        pinned = sync.get("pinned_composers") or []
+        excluded = sync.get("excluded_composers") or []
+        print(f"  pinned_composers:      {len(pinned)}")
+        for cid in pinned[:10]:
+            print(f"    {cid}")
+        if len(pinned) > 10:
+            print(f"    ... and {len(pinned) - 10} more")
+        print(f"  excluded_composers:    {len(excluded)}")
+        for cid in excluded[:10]:
+            print(f"    {cid}")
+        if len(excluded) > 10:
+            print(f"    ... and {len(excluded) - 10} more")
+        return
+
+    updates = {}
+    if args.retention_days is not None:
+        updates["retention_days"] = args.retention_days
+    if args.retention_purge_local is not None:
+        updates["retention_purge_local"] = args.retention_purge_local
+
+    if not updates:
+        print(
+            "Error: specify --retention-days, --retention-purge-local, or --show.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    sync = save_sync_config(updates)
+    print("Sync settings saved:")
+    print(f"  retention_days:        {sync.get('retention_days')}")
+    print(f"  retention_purge_local: {sync.get('retention_purge_local')}")
+
+
 def cmd_config(args):
     """Configuration subcommands."""
     if args.config_command == "git":
         cmd_config_git(args)
+    elif args.config_command == "sync":
+        cmd_config_sync(args)
     else:
         print("Error: unknown config command.", file=sys.stderr)
         sys.exit(1)
+
+
+def cmd_remove(args):
+    """Remove chats from sync repo and Cursor; never sync again."""
+    from .chat_lifecycle import remove_chats
+
+    composer_ids: list[str] = []
+    if args.id:
+        composer_ids.append(args.id)
+    if getattr(args, "ids", None):
+        composer_ids.extend(i.strip() for i in args.ids.split(",") if i.strip())
+
+    if not composer_ids:
+        print("Error: specify --id or --ids.", file=sys.stderr)
+        sys.exit(1)
+
+    composer_ids = list(dict.fromkeys(composer_ids))
+
+    if not args.yes:
+        print(f"Remove {len(composer_ids)} chat(s) from sync and Cursor?")
+        for cid in composer_ids:
+            print(f"  {cid}")
+        try:
+            confirm = input("\nContinue? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if confirm not in ("y", "yes"):
+            print("Cancelled.")
+            return
+
+    result = remove_chats(
+        composer_ids,
+        purge_local=not args.snapshot_only,
+        push_remote=True,
+        force=args.force,
+    )
+    print(
+        f"Removed {result.removed_snapshots} snapshot(s), "
+        f"purged {result.purged_local} local chat(s), "
+        f"excluded {result.excluded} from future sync."
+    )
+
+
+def cmd_pin(args):
+    """Pin or unpin chats (pinned chats skip retention pruning)."""
+    from .chat_lifecycle import pin_composer, unpin_composer
+
+    if not args.id:
+        print("Error: --id is required.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.unpin:
+        unpin_composer(args.id)
+        print(f"Unpinned {args.id}")
+    else:
+        pin_composer(args.id)
+        print(f"Pinned {args.id} (exempt from retention pruning)")
 
 
 def _configure_git_verbose(args) -> None:
@@ -1204,6 +1328,23 @@ def cmd_setup(args):
     setup_wizard.run_setup(args)
 
 
+def _apply_retention_prune(verbose: bool = False) -> int:
+    """Prune expired snapshots and push deletions to remote."""
+    from .chat_lifecycle import apply_retention
+
+    result = apply_retention()
+    if result.pruned <= 0:
+        return 0
+
+    sync_dir = paths.get_sync_dir()
+    hostname = paths.get_machine_id()
+    msg = f"[{hostname}] retention: pruned {result.pruned} snapshot(s)"
+    if _commit_and_push(sync_dir, msg):
+        if verbose:
+            print(f"  Retention: pruned {result.pruned} snapshot(s)")
+    return result.pruned
+
+
 def cmd_sync(args):
     """Pull behind conversations then push ahead ones — fully automatic."""
     _configure_stdio()
@@ -1240,7 +1381,12 @@ def cmd_sync(args):
     else:
         print("  Everything up to date")
 
-    # Step 3: Push — export ahead conversations from Cursor DBs into snapshots
+    # Step 3: Retention — prune old snapshots before push
+    pruned = _apply_retention_prune(verbose=getattr(args, "verbose", False))
+    if pruned > 0 and not getattr(args, "verbose", False):
+        print(f"  Retention: pruned {pruned} expired snapshot(s)")
+
+    # Step 4: Push — export conversations from Cursor DBs into snapshots
     print("\n── Push ──")
     pushed = _push_ahead(sync_dir, auto=True, backend=backend)
     if pushed == 0:
@@ -2191,6 +2337,73 @@ def main():
     )
     p_config_git.set_defaults(func=cmd_config)
 
+    p_config_sync = config_sub.add_parser(
+        "sync", help="Configure sync lifecycle (retention, pins, exclusions)"
+    )
+    p_config_sync.add_argument(
+        "--retention-days",
+        type=int,
+        default=None,
+        help="Prune snapshot files older than N days before push (0 = off, default 90)",
+    )
+    p_config_sync.add_argument(
+        "--retention-purge-local",
+        action="store_true",
+        default=None,
+        help="Also purge local Cursor DB when retention expires a chat",
+    )
+    p_config_sync.add_argument(
+        "--no-retention-purge-local",
+        action="store_false",
+        dest="retention_purge_local",
+        help="Do not purge local chats on retention (default)",
+    )
+    p_config_sync.add_argument(
+        "--show",
+        action="store_true",
+        help="Show current sync lifecycle settings",
+    )
+    p_config_sync.set_defaults(func=cmd_config)
+
+    # ── remove ────────────────────────────────────────────────────
+    p_remove = subparsers.add_parser(
+        "remove",
+        help="Remove chats from sync repo and Cursor (never sync again)",
+    )
+    p_remove.add_argument("--id", help="Composer / snapshot ID to remove")
+    p_remove.add_argument(
+        "--ids",
+        help="Comma-separated composer IDs",
+    )
+    p_remove.add_argument(
+        "--snapshot-only",
+        action="store_true",
+        help="Remove snapshots only; keep chats in Cursor",
+    )
+    p_remove.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip Cursor-running check when purging local chats",
+    )
+    p_remove.add_argument(
+        "-y", "--yes",
+        action="store_true",
+        help="Skip confirmation prompt",
+    )
+    p_remove.set_defaults(func=cmd_remove)
+
+    # ── pin ───────────────────────────────────────────────────────
+    p_pin = subparsers.add_parser(
+        "pin", help="Pin or unpin chats (pinned = exempt from retention)"
+    )
+    p_pin.add_argument("--id", required=True, help="Composer ID")
+    p_pin.add_argument(
+        "--unpin",
+        action="store_true",
+        help="Remove pin instead of adding",
+    )
+    p_pin.set_defaults(func=cmd_pin)
+
     # ── auth ──────────────────────────────────────────────────────
     p_auth = subparsers.add_parser("auth", help="Authenticate with external services")
     auth_sub = p_auth.add_subparsers(dest="auth_command")
@@ -2499,6 +2712,9 @@ def main():
     args = parser.parse_args()
     if args.command == "profile" and not getattr(args, "profile_command", None):
         p_profile.print_help()
+        sys.exit(1)
+    if args.command == "config" and not getattr(args, "config_command", None):
+        p_config.print_help()
         sys.exit(1)
     if not args.command:
         print(

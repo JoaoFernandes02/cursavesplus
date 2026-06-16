@@ -8,7 +8,7 @@ from ..runner import CommandRunner
 from .. import state
 
 
-def build_dashboard(parent, runner: CommandRunner, on_go_setup, refresh_status) -> None:
+def build_dashboard(parent, runner: CommandRunner, on_go_setup, refresh_status, require_sync_ready) -> None:
     frame = ctk.CTkFrame(parent, fg_color="transparent")
     frame.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -29,10 +29,9 @@ def build_dashboard(parent, runner: CommandRunner, on_go_setup, refresh_status) 
     stats_label.pack(anchor="w", padx=12, pady=12)
 
     def refresh_dashboard_ui():
-        configured = state.is_configured()
-        if configured:
+        if state.is_sync_ready():
             banner_label.configure(
-                text="cursaves is configured. Use Sync now or rely on auto-sync hook.",
+                text="cursaves is ready to sync. Use Sync now or rely on auto-sync hook.",
                 text_color=("gray10", "gray90"),
             )
             stats = state.get_dashboard_stats()
@@ -43,18 +42,28 @@ def build_dashboard(parent, runner: CommandRunner, on_go_setup, refresh_status) 
                     f"Profile items pending sync: {stats['pending_profile']}"
                 ),
             )
-        else:
+        elif state.is_github_logged_in():
+            gh = state.get_github_auth()
+            login = gh.get("login") or "GitHub"
             banner_label.configure(
-                text="Not configured — go to the Setup tab to initialize cursaves.",
+                text=f"Logged in as @{login} — go to Setup to choose a sync repository.",
                 text_color=("#b45309", "#fbbf24"),
             )
-            stats_label.configure(text="Complete Setup → Init, then Run setup.")
+            stats_label.configure(text="Complete Setup → Login with GitHub → choose sync repo.")
+        else:
+            banner_label.configure(
+                text="Not configured — go to Setup → Login with GitHub.",
+                text_color=("#b45309", "#fbbf24"),
+            )
+            stats_label.configure(text="Complete Setup → Login with GitHub, then choose sync repo.")
 
     def refresh_dashboard():
         refresh_dashboard_ui()
         refresh_status()
 
     def run_cmd(args):
+        if not require_sync_ready():
+            return
         runner.run(CommandRunner.cursaves_argv(*args))
 
     btn_frame = ctk.CTkFrame(frame, fg_color="transparent")

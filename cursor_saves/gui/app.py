@@ -19,7 +19,7 @@ class CursavesApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
-        self._configured = state.is_configured()
+        self._configured = state.is_sync_ready()
         self._build_ui()
         self._refresh_status_bar()
         self.after(30_000, self._periodic_refresh)
@@ -59,14 +59,22 @@ class CursavesApp(ctk.CTk):
         self.status_bar = ctk.CTkLabel(self, text="", anchor="w", font=ctk.CTkFont(size=11))
         self.status_bar.pack(fill="x", padx=12, pady=(0, 8))
 
-        def is_enabled():
-            return self._configured
+        def is_sync_ready():
+            return state.is_sync_ready()
+
+        def require_sync_ready() -> bool:
+            reason = state.get_setup_block_reason()
+            if reason is None:
+                return True
+            self.log.append(f"\n{reason}\n")
+            self.tabview.set("Setup")
+            return False
 
         def go_setup():
             self.tabview.set("Setup")
 
         def on_configured():
-            self._configured = state.is_configured()
+            self._configured = state.is_sync_ready()
             self._refresh_all()
 
         dashboard.build_dashboard(
@@ -74,16 +82,21 @@ class CursavesApp(ctk.CTk):
             self.runner,
             on_go_setup=go_setup,
             refresh_status=self._refresh_status_bar,
+            require_sync_ready=require_sync_ready,
         )
-        sync.build_sync(self.tabview.tab("Sync"), self.runner, is_enabled)
-        autosync.build_autosync(self.tabview.tab("Auto-sync"), self.runner)
-        profile.build_profile(self.tabview.tab("Profile"), self.runner, is_enabled)
+        sync.build_sync(self.tabview.tab("Sync"), self.runner, require_sync_ready)
+        autosync.build_autosync(
+            self.tabview.tab("Auto-sync"),
+            self.runner,
+            require_sync_ready=require_sync_ready,
+        )
+        profile.build_profile(self.tabview.tab("Profile"), self.runner, require_sync_ready)
         info.build_info(self.tabview.tab("Info"), self.runner)
         tools.build_tools(
             self.tabview.tab("Tools"),
             self.runner,
             self.log.append,
-            is_enabled,
+            require_sync_ready,
         )
         setup.build_setup(self.tabview.tab("Setup"), self.runner, on_configured)
 
@@ -93,7 +106,7 @@ class CursavesApp(ctk.CTk):
     def _on_command_done(self, code: int) -> None:
         if code != 0:
             self.log.append(f"\n[exit code {code}]\n")
-        self._configured = state.is_configured()
+        self._configured = state.is_sync_ready()
         self._refresh_all()
 
     def _refresh_status_bar(self) -> None:

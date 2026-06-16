@@ -7,7 +7,7 @@ import customtkinter as ctk
 from ..runner import CommandRunner
 
 
-def build_profile(parent, runner: CommandRunner, is_enabled: callable) -> None:
+def build_profile(parent, runner: CommandRunner, require_sync_ready: callable) -> None:
     frame = ctk.CTkFrame(parent, fg_color="transparent")
     frame.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -22,7 +22,7 @@ def build_profile(parent, runner: CommandRunner, is_enabled: callable) -> None:
     btn_frame.pack(fill="x", pady=4)
 
     def run(args):
-        if not is_enabled():
+        if not require_sync_ready():
             return
         runner.run(CommandRunner.cursaves_argv(*args))
 

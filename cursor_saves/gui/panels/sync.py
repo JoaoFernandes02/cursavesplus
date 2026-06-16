@@ -8,7 +8,7 @@ from ..runner import CommandRunner
 from ..widgets import WorkspaceSelector, warn_cursor_running
 
 
-def build_sync(parent, runner: CommandRunner, is_enabled: callable) -> WorkspaceSelector:
+def build_sync(parent, runner: CommandRunner, require_sync_ready: callable) -> WorkspaceSelector:
     frame = ctk.CTkFrame(parent, fg_color="transparent")
     frame.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -21,7 +21,7 @@ def build_sync(parent, runner: CommandRunner, is_enabled: callable) -> Workspace
     btn_frame.pack(fill="x", pady=4)
 
     def run(args):
-        if not is_enabled():
+        if not require_sync_ready():
             return
         runner.run(CommandRunner.cursaves_argv(*args))
 

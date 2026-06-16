@@ -80,6 +80,35 @@ def get_git_identity() -> dict:
     return identity
 
 
+def is_github_logged_in() -> bool:
+    return github_auth.is_authenticated()
+
+
+def is_sync_ready() -> bool:
+    return (
+        is_github_logged_in()
+        and is_configured()
+        and get_remote_url() is not None
+    )
+
+
+def get_setup_block_reason() -> Optional[str]:
+    """Return a user-facing reason why sync features are blocked, or None if ready."""
+    if not github_auth.find_gh():
+        return "GitHub CLI (gh) is not installed. Go to Setup → Login with GitHub."
+    if not is_github_logged_in():
+        return "Not logged in to GitHub. Go to Setup → Login with GitHub."
+    if not is_configured():
+        return "Sync repo not initialized. Go to Setup and complete the GitHub login flow."
+    if not get_remote_url():
+        login = get_github_auth().get("login") or "your account"
+        return (
+            f"Logged in as @{login}, but no sync remote is configured. "
+            "Go to Setup and choose a sync repository."
+        )
+    return None
+
+
 def get_github_auth() -> dict:
     """Return GitHub login state from config and gh auth status."""
     cfg = dict(load_config().get("github", {}))
@@ -124,6 +153,12 @@ def get_status_bar_text() -> str:
         f"Machine: {paths.get_machine_id()}",
         f"Sync repo: {'yes' if is_configured() else 'no'}",
     ]
+    gh = get_github_auth()
+    if gh.get("authenticated"):
+        login = gh.get("login")
+        parts.append(f"GitHub: @{login}" if login else "GitHub: logged in")
+    else:
+        parts.append("GitHub: not logged in")
     remote = get_remote_url()
     if remote:
         if len(remote) > 40:

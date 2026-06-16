@@ -4,6 +4,38 @@
 
 **Cursaves+** is an enhanced fork of [cursaves](https://github.com/Callum-Ward/cursaves) by **[Callum Ward](https://github.com/Callum-Ward)** — the original author and copyright holder of the base project.
 
+## North star: two devices, zero manual sync
+
+Use **Cursor on two PCs at the same time** with no babysitting:
+
+1. **Global profile** stays identical — settings (dark mode), keybindings, skills, commands, agents, hooks, rules, CLI config
+2. **Project chats** sync via git remote identifier (same `origin` = same snapshot bucket)
+3. **Auto-sync** runs while Cursor is open (~120s interval via `watch --install-hook`)
+
+**Typical flow:**
+
+| Step | PC1 | PC2 |
+|------|-----|-----|
+| Setup (once) | `cursaves auth github` + `cursaves watch --install-hook` | Same on PC2 |
+| Work on project A | Open repo, chat → auto-push snapshots | Open same repo → auto-pull + import chats |
+| Work on project B | — | Open repo B, chat → auto-push |
+| See PC2's chats | `git clone` project B, open in Cursor → chats import on next sync | — |
+
+One private `cursaves-data` repo is the hub for **profile + all project chats**. Project identity comes from the git remote URL, not your local folder path.
+
+**Checklist (both machines, one time):**
+
+```bash
+cursaves auth github          # login + sync remote
+cursaves watch --install-hook # auto-sync when Cursor opens
+```
+
+Restart Cursor after imports or profile changes to see them in the sidebar.
+
+**Repo hygiene (optional):** `cursaves remove` stops syncing a chat forever; `cursaves pin` protects favorites from retention; `cursaves config sync --retention-days 90` prunes old snapshots (default 90, `0` = off). Project rules in `.cursor/rules` inside a repo sync with that repo's git — not via cursaves-data.
+
+---
+
 Cursor stores chats locally. Switch machines and they're gone. This tool saves your chats to a git repo (or S3 bucket) so you can restore them anywhere — or copy them between workspaces on the same machine.
 
 ## Cursaves+ features
@@ -14,7 +46,7 @@ This fork extends the original cursaves with:
 |---------|-------------|
 | **Login with GitHub** | One browser login sets up push/pull auth, commit identity, and HTTPS sync remote via [GitHub CLI](https://cli.github.com/) (`gh`). GUI/setup can auto-install `winget` + `gh` on Windows |
 | **Desktop GUI** | Running `cursaves` with no args opens a CustomTkinter app (Dashboard, Sync, Auto-sync, Profile, Info, Tools, Setup) |
-| **Profile sync** | Sync settings, keybindings, snippets, skills, commands, agents, hooks, and CLI config via the same private remote (`profile push/pull/status`, included in `sync`) |
+| **Profile sync** | Sync settings, keybindings, snippets, skills, commands, agents, hooks, rules, and CLI config via the same private remote (`profile push/pull/status`, included in `sync`) |
 | **Git commit identity** | Per-repo identity for `~/.cursaves/` commits (name/email, GPG off by default) — auto-filled from GitHub login or `cursaves config git` |
 | **Windows support** | Full support on Windows (`%APPDATA%` paths, one-click `Install Cursaves.bat`) |
 | **Setup wizard** | `cursaves setup` — interactive first-run (GitHub login, remote, profile, hook) |
@@ -23,7 +55,7 @@ This fork extends the original cursaves with:
 | **Desktop shortcuts** | Create shortcuts from the GUI Setup tab |
 | **Interactive TUI** | Fuzzy multi-select for push/pull/copy/purge (`-s` flags, InquirerPy) |
 
-New commands: `auth github`, `config git`, `setup`, `profile push|pull|status`, `gui`, `watch --install-hook|--uninstall-hook|--all|--detach`.
+New commands: `auth github`, `config git`, `config sync`, `setup`, `remove`, `pin`, `profile push|pull|status`, `gui`, `watch --install-hook|--uninstall-hook|--all|--detach`.
 
 Based on [cursaves](https://github.com/Callum-Ward/cursaves) by **Callum Ward** — all upstream features (sync, push/pull, SSH workspaces, doctor, migrate, purge, etc.) are included unchanged.
 
@@ -98,9 +130,11 @@ cursaves sync
 Flow in the GUI:
 
 1. A popup shows the **8-character GitHub code**; the browser opens to `github.com/login/device`
-2. Paste the code on GitHub and authorize
-3. After login succeeds, you choose an existing sync repo or let cursaves create `cursaves-data`
-4. Setup status updates to show `@your-github-username`
+2. Paste the code on GitHub and authorize — the popup closes automatically when login completes
+3. Setup shows `@your-github-username`; you choose an existing sync repo or let cursaves create `cursaves-data`
+4. **Sync / Push / Pull** are enabled only after GitHub login **and** sync repo setup are complete
+
+Until setup is complete, sync actions show a message in the Output panel and redirect you to **Setup**.
 
 On **Windows**, if `winget` or `gh` are missing, the GUI asks once and installs both automatically. The CLI (`cursaves auth github`) and `cursaves setup` offer the same install prompt.
 
@@ -353,6 +387,8 @@ cursaves sync
 | GPG / signing prompts | Run `cursaves config git --no-sign` or re-run `cursaves auth github` (GPG disabled for sync repo) |
 | Not logged in | `cursaves auth github --status` then `cursaves auth github` |
 | `gh` / `winget` not found | Use **Setup → Login with GitHub** in the GUI (auto-installs on Windows), or `cursaves auth github` / `cursaves setup` |
+| Account not shown after GitHub login | Check the **Output** panel for errors; re-run **Login with GitHub**; try `cursaves auth github --status` |
+| Sync button does nothing in GUI | Complete full setup: GitHub login + sync repo (Setup tab). Output panel explains what is missing |
 
 ### Auto-sync with `watch`
 

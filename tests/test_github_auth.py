@@ -84,19 +84,27 @@ class SaveAuthConfigTests(unittest.TestCase):
 class FetchProfileTests(unittest.TestCase):
     @mock.patch("cursor_saves.github_auth.ensure_gh", return_value="gh")
     @mock.patch("cursor_saves.github_auth.is_authenticated", return_value=True)
+    @mock.patch("cursor_saves.github_auth._gh_api_json_optional")
     @mock.patch("cursor_saves.github_auth._gh_api_json")
-    def test_fetch_profile_primary_email(self, mock_api, _mock_auth, _mock_gh):
-        mock_api.side_effect = [
-            {"login": "alice", "name": "Alice"},
-            [
-                {"email": "a@users.noreply.github.com", "primary": False, "verified": True},
-                {"email": "alice@example.com", "primary": True, "verified": True},
-            ],
+    def test_fetch_profile_primary_email(self, mock_api, mock_emails, _mock_auth, _mock_gh):
+        mock_api.return_value = {"login": "alice", "name": "Alice"}
+        mock_emails.return_value = [
+            {"email": "a@users.noreply.github.com", "primary": False, "verified": True},
+            {"email": "alice@example.com", "primary": True, "verified": True},
         ]
         profile = github_auth.fetch_profile()
         self.assertEqual(profile.login, "alice")
         self.assertEqual(profile.name, "Alice")
         self.assertEqual(profile.email, "alice@example.com")
+
+    @mock.patch("cursor_saves.github_auth.ensure_gh", return_value="gh")
+    @mock.patch("cursor_saves.github_auth.is_authenticated", return_value=True)
+    @mock.patch("cursor_saves.github_auth._gh_api_json_optional", return_value=None)
+    @mock.patch("cursor_saves.github_auth._gh_api_json")
+    def test_fetch_profile_noreply_when_emails_fail(self, mock_api, _mock_emails, _mock_auth, _mock_gh):
+        mock_api.return_value = {"login": "bob", "name": "Bob"}
+        profile = github_auth.fetch_profile()
+        self.assertEqual(profile.email, "bob@users.noreply.github.com")
 
 
 class ResolveRemoteTests(unittest.TestCase):
@@ -176,6 +184,15 @@ class LoginWebTests(unittest.TestCase):
         with mock.patch("cursor_saves.github_auth.find_gh", return_value="gh"):
             with mock.patch("cursor_saves.github_auth._run_gh", return_value=result):
                 self.assertEqual(github_auth.get_auth_status_login(), "alice")
+
+    @mock.patch("cursor_saves.github_auth.find_gh", return_value="gh")
+    @mock.patch("cursor_saves.github_auth._run_gh")
+    def test_get_auth_status_login_api_fallback(self, mock_run, _mock_find):
+        mock_run.side_effect = [
+            subprocess.CompletedProcess([], 1, "", "not logged in"),
+            subprocess.CompletedProcess([], 0, "alice\n", ""),
+        ]
+        self.assertEqual(github_auth.get_auth_status_login(), "alice")
 
 
 class InstallGhTests(unittest.TestCase):

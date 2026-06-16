@@ -20,6 +20,7 @@ DEFAULT_CATEGORIES = {
     "commands": True,
     "agents": True,
     "hooks": True,
+    "rules": True,
     "cli": True,
     "mcp": False,
 }
@@ -48,6 +49,7 @@ PROFILE_CATALOG: tuple[ProfileEntry, ...] = (
     ProfileEntry("agents", "cursor/agents", "cursor", "agents", is_dir=True),
     ProfileEntry("hooks", "cursor/hooks.json", "cursor", "hooks.json", optional=True),
     ProfileEntry("hooks", "cursor/hooks", "cursor", "hooks", optional=True, is_dir=True),
+    ProfileEntry("rules", "cursor/rules", "cursor", "rules", optional=True, is_dir=True),
     ProfileEntry("cli", "cursor/cli-config.json", "cursor", "cli-config.json", optional=True),
     ProfileEntry("cli", "cursor/statusline.sh", "cursor", "statusline.sh", optional=True),
     ProfileEntry("mcp", "cursor/mcps", "cursor", "mcps", optional=True, is_dir=True),

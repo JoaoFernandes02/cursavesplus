@@ -103,6 +103,7 @@ def _run_full_sync(git_sync: bool = True, verbose: bool = False) -> tuple[int, i
     """
     from .backends import get_backend
     from .cli import (
+        _apply_retention_prune,
         _profile_apply_after_pull,
         _profile_export_push,
         _profile_sync_enabled,
@@ -134,6 +135,10 @@ def _run_full_sync(git_sync: bool = True, verbose: bool = False) -> tuple[int, i
     imported = _pull_behind(sync_dir)
     if imported > 0:
         print(f"[{_now()}] Imported {imported} conversation(s) from remote")
+
+    pruned = _apply_retention_prune(verbose=verbose)
+    if pruned > 0:
+        print(f"[{_now()}] Retention: pruned {pruned} expired snapshot(s)")
 
     pushed = 0
     if git_sync:

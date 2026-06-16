@@ -9,7 +9,7 @@ from ..runner import CommandRunner
 from ..widgets import ChatCheckList, WorkspaceSelector, confirm_action, warn_cursor_running
 
 
-def build_tools(parent, runner: CommandRunner, log_append, is_enabled: callable) -> None:
+def build_tools(parent, runner: CommandRunner, log_append, require_sync_ready) -> None:
     frame = ctk.CTkScrollableFrame(parent, fg_color="transparent")
     frame.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -21,7 +21,7 @@ def build_tools(parent, runner: CommandRunner, log_append, is_enabled: callable)
     maint_frame.pack(fill="x", pady=4)
 
     def run(args):
-        if not is_enabled() and args[0] not in ("doctor", "repair", "migrate"):
+        if args[0] not in ("doctor", "repair", "migrate") and not require_sync_ready():
             return
         runner.run(CommandRunner.cursaves_argv(*args))
 
@@ -151,4 +151,76 @@ def build_tools(parent, runner: CommandRunner, log_append, is_enabled: callable)
 
     ctk.CTkButton(copy_frame, text="Copy selected chats", command=do_copy, width=180).pack(
         anchor="w", padx=4, pady=8,
+    )
+
+    ctk.CTkLabel(frame, text="Manage synced chats", font=ctk.CTkFont(weight="bold")).pack(
+        anchor="w", padx=4, pady=(12, 4),
+    )
+    ctk.CTkLabel(
+        frame,
+        text="Remove stops sync forever. Pin keeps chats during retention pruning.",
+        text_color="gray",
+        wraplength=500,
+        justify="left",
+    ).pack(anchor="w", padx=4, pady=(0, 4))
+
+    manage_frame = ctk.CTkFrame(frame, fg_color="transparent")
+    manage_frame.pack(fill="x", pady=4)
+    ws_manage = WorkspaceSelector(manage_frame, label="Workspace")
+    manage_list = ChatCheckList(manage_frame, height=140)
+
+    def load_manage_chats():
+        ws = ws_manage.get_workspace()
+        if ws:
+            manage_list.load(ws["path"], ws["workspace_dir"])
+
+    ctk.CTkButton(
+        manage_frame,
+        text="Load chats",
+        command=load_manage_chats,
+        width=120,
+    ).pack(anchor="w", padx=4, pady=4)
+
+    manage_btn_row = ctk.CTkFrame(manage_frame, fg_color="transparent")
+    manage_btn_row.pack(fill="x", padx=4, pady=4)
+
+    def remove_selected():
+        if warn_cursor_running("remove", allow_force=True) is False:
+            return
+        ids = manage_list.selected_ids()
+        if not ids:
+            log_append("No chats selected.\n")
+            return
+        if not confirm_action(
+            "Remove chats",
+            f"Remove {len(ids)} chat(s) from sync and Cursor?\nThey will never sync again.",
+        ):
+            return
+        args = ["remove", "--ids", ",".join(ids), "-y", "--force"]
+        run(args)
+
+    def pin_selected():
+        ids = manage_list.selected_ids()
+        if not ids:
+            log_append("No chats selected.\n")
+            return
+        for cid in ids:
+            run(["pin", "--id", cid])
+
+    def unpin_selected():
+        ids = manage_list.selected_ids()
+        if not ids:
+            log_append("No chats selected.\n")
+            return
+        for cid in ids:
+            run(["pin", "--id", cid, "--unpin"])
+
+    ctk.CTkButton(manage_btn_row, text="Remove selected", command=remove_selected, width=130).pack(
+        side="left", padx=4,
+    )
+    ctk.CTkButton(manage_btn_row, text="Pin / Favorito", command=pin_selected, width=120).pack(
+        side="left", padx=4,
+    )
+    ctk.CTkButton(manage_btn_row, text="Unpin", command=unpin_selected, width=80).pack(
+        side="left", padx=4,
     )

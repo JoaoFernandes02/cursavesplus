@@ -8,7 +8,7 @@ from .. import state
 from ..runner import CommandRunner
 
 
-def build_autosync(parent, runner: CommandRunner) -> None:
+def build_autosync(parent, runner: CommandRunner, *, require_sync_ready) -> None:
     frame = ctk.CTkFrame(parent, fg_color="transparent")
     frame.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -16,6 +16,11 @@ def build_autosync(parent, runner: CommandRunner) -> None:
     status_label.pack(anchor="w", padx=4, pady=8)
 
     def run(args):
+        if args[0] == "watch" and args[-1] in ("--uninstall-hook",):
+            runner.run(CommandRunner.cursaves_argv(*args))
+            return
+        if not require_sync_ready():
+            return
         runner.run(CommandRunner.cursaves_argv(*args))
 
     def open_hooks():

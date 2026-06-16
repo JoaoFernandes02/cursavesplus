@@ -282,18 +282,22 @@ def get_auth_status_login() -> Optional[str]:
     if not find_gh():
         return None
     result = _run_gh(["auth", "status", "-h", GITHUB_HOST])
-    if result.returncode != 0:
-        return None
-    text = result.stdout + result.stderr
-    patterns = [
-        r"Logged in to github\.com account (\S+)",
-        r"Logged in to github\.com as (\S+)",
-        r"account\s+(\S+)\s+\(",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text)
-        if m:
-            return m.group(1).lstrip("@")
+    if result.returncode == 0:
+        text = result.stdout + result.stderr
+        patterns = [
+            r"Logged in to github\.com account (\S+)",
+            r"Logged in to github\.com as (\S+)",
+            r"account\s+(\S+)\s+\(",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, text)
+            if m:
+                return m.group(1).lstrip("@")
+    api_result = _run_gh(["api", "user", "-q", ".login"], timeout=30)
+    if api_result.returncode == 0:
+        login = api_result.stdout.strip()
+        if login:
+            return login
     return None
 
 
@@ -361,6 +365,8 @@ def login_web(
         "-h",
         GITHUB_HOST,
         "--skip-ssh-key",
+        "--scopes",
+        "user:email",
     ]
 
     status("Opening browser for GitHub login...")
@@ -453,6 +459,17 @@ def _gh_api_json(endpoint: str) -> dict:
         sys.exit(1)
 
 
+def _gh_api_json_optional(endpoint: str) -> Optional[object]:
+    """Call GitHub API; return parsed JSON or None on failure (no exit)."""
+    result = _run_gh(["api", endpoint], timeout=60)
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
 def fetch_profile() -> GitHubProfile:
     """Fetch name, login, and primary verified email from GitHub."""
     ensure_gh()
@@ -464,8 +481,8 @@ def fetch_profile() -> GitHubProfile:
     login = user.get("login") or ""
     name = user.get("name") or login
 
-    emails = _gh_api_json("user/emails")
     email = ""
+    emails = _gh_api_json_optional("user/emails")
     if isinstance(emails, list):
         primary = [e for e in emails if e.get("primary") and e.get("verified")]
         if primary:

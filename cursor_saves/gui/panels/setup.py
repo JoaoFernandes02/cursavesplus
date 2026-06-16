@@ -10,6 +10,7 @@ from ... import github_auth
 from .. import state
 from ..runner import CommandRunner
 from ..shortcut import create_desktop_shortcut
+from ..widgets import confirm_action
 
 
 class _DeviceCodeDialog(ctk.CTkToplevel):
@@ -18,10 +19,12 @@ class _DeviceCodeDialog(ctk.CTkToplevel):
     def __init__(self, parent, code: str):
         super().__init__(parent)
         self.title("GitHub login code")
-        self.geometry("460x280")
+        self.geometry("460x260")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
+        self._poll_job: str | None = None
+        self._close_job: str | None = None
 
         ctk.CTkLabel(
             self,
@@ -36,13 +39,14 @@ class _DeviceCodeDialog(ctk.CTkToplevel):
             font=ctk.CTkFont(size=32, weight="bold"),
         ).pack(padx=16, pady=8)
 
-        ctk.CTkLabel(
+        self._status_label = ctk.CTkLabel(
             self,
-            text="Waiting for authorization… You can close this after pasting the code.",
+            text="This window will close automatically when login completes.",
             text_color="gray",
             wraplength=420,
             justify="left",
-        ).pack(padx=16, pady=(4, 12))
+        )
+        self._status_label.pack(padx=16, pady=(4, 12))
 
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
         btn_row.pack(padx=16, pady=8)
@@ -59,9 +63,43 @@ class _DeviceCodeDialog(ctk.CTkToplevel):
             command=self._open_github,
             width=110,
         ).pack(side="left", padx=4)
-        ctk.CTkButton(btn_row, text="OK", command=self.destroy, width=80).pack(
-            side="left", padx=4,
-        )
+
+        self._poll_auth()
+
+    def _poll_auth(self) -> None:
+        if not self.winfo_exists():
+            return
+        if github_auth.is_authenticated():
+            self._status_label.configure(
+                text="Logged in! This window will close…",
+                text_color=("green", "#4ade80"),
+            )
+            self._close_job = self.after(1500, self._close)
+            return
+        self._poll_job = self.after(1000, self._poll_auth)
+
+    def _close(self) -> None:
+        self._cancel_jobs()
+        if self.winfo_exists():
+            self.destroy()
+
+    def _cancel_jobs(self) -> None:
+        if self._poll_job:
+            try:
+                self.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
+        if self._close_job:
+            try:
+                self.after_cancel(self._close_job)
+            except Exception:
+                pass
+            self._close_job = None
+
+    def destroy(self) -> None:
+        self._cancel_jobs()
+        super().destroy()
 
     def _copy_code(self, code: str) -> None:
         self.clipboard_clear()
@@ -224,7 +262,12 @@ def build_setup(parent, runner: CommandRunner, on_configured) -> None:
                 on_status=_gui_status,
             )
 
-        runner.run_callable(task, capture_output=False)
+        def _after_repo_setup(exit_code: int):
+            parent.after(0, refresh_status)
+            if exit_code == 0:
+                parent.after(0, on_configured)
+
+        runner.run_callable(task, capture_output=False, on_done=_after_repo_setup)
 
     def _open_repo_dialog():
         _RepoDialog(parent.winfo_toplevel(), _finish_github_login)
@@ -234,6 +277,7 @@ def build_setup(parent, runner: CommandRunner, on_configured) -> None:
         if _device_code_dialog and _device_code_dialog.winfo_exists():
             parent.after(0, _device_code_dialog.destroy)
             _device_code_dialog = None
+        parent.after(0, refresh_status)
         if code == 0 and github_auth.is_authenticated():
             parent.after(0, _open_repo_dialog)
         elif code != 0:
@@ -299,6 +343,30 @@ def build_setup(parent, runner: CommandRunner, on_configured) -> None:
         command=start_github_login,
         width=180,
     ).pack(anchor="w", padx=4, pady=8)
+
+    def logout_github():
+        if not github_auth.is_authenticated():
+            status_label.configure(text="Not logged in to GitHub.")
+            refresh_status()
+            return
+        if not confirm_action(
+            "Logout from GitHub",
+            "Log out from GitHub?\n\n"
+            "Push/pull will stop working until you log in again on this machine.",
+        ):
+            return
+        github_auth.logout()
+        status_label.configure(text="Logged out from GitHub.")
+        refresh_status()
+
+    ctk.CTkButton(
+        frame,
+        text="Logout from GitHub",
+        command=logout_github,
+        width=180,
+        fg_color="gray30",
+        hover_color="gray25",
+    ).pack(anchor="w", padx=4, pady=(0, 8))
 
     ctk.CTkLabel(frame, text="Run full setup", font=ctk.CTkFont(weight="bold")).pack(
         anchor="w", padx=4, pady=(12, 4),
