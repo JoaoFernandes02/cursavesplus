@@ -34,6 +34,16 @@ if ! command -v git >/dev/null 2>&1; then
 fi
 echo "Git: $(git --version)"
 
+if ! command -v gh >/dev/null 2>&1; then
+    echo ""
+    echo "GitHub CLI (gh) is not installed — needed for Login with GitHub."
+    echo "Install with: brew install gh   (macOS) or see https://cli.github.com/"
+    echo "You can still use manual git/SSH setup without gh."
+    echo ""
+else
+    echo "GitHub CLI: $(gh --version)"
+fi
+
 install_uv() {
     echo ""
     echo "uv is not installed."

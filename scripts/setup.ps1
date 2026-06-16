@@ -37,6 +37,16 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 }
 Write-Host "Git: $(git --version)"
 
+if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+    Write-Host ""
+    Write-Host "GitHub CLI (gh) is not installed — needed for Login with GitHub."
+    Write-Host "Install with: winget install GitHub.cli"
+    Write-Host "You can still use manual git/SSH setup without gh."
+    Write-Host ""
+} else {
+    Write-Host "GitHub CLI: $(gh --version)"
+}
+
 function Install-Uv {
     Write-Host ""
     Write-Host "uv is not installed."

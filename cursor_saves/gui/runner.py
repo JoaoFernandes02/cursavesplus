@@ -49,7 +49,14 @@ class CommandRunner:
         self._thread = threading.Thread(target=self._run_subprocess, args=(argv,), daemon=True)
         self._thread.start()
 
-    def run_callable(self, fn: Callable, *args, **kwargs) -> None:
+    def run_callable(
+        self,
+        fn: Callable,
+        *args,
+        capture_output: bool = True,
+        on_done: Optional[Callable[[int], None]] = None,
+        **kwargs,
+    ) -> None:
         if self.is_running:
             self._on_line("Another command is already running.\n")
             return
@@ -57,7 +64,7 @@ class CommandRunner:
         self._on_start(getattr(fn, "__name__", "callable"))
         self._thread = threading.Thread(
             target=self._run_callable,
-            args=(fn, args, kwargs),
+            args=(fn, args, kwargs, capture_output, on_done),
             daemon=True,
         )
         self._thread.start()
@@ -96,15 +103,25 @@ class CommandRunner:
                 self._process = None
             self._on_done(code)
 
-    def _run_callable(self, fn: Callable, args: tuple, kwargs: dict) -> None:
+    def _run_callable(
+        self,
+        fn: Callable,
+        args: tuple,
+        kwargs: dict,
+        capture_output: bool,
+        on_done: Optional[Callable[[int], None]],
+    ) -> None:
         code = 0
         buffer = io.StringIO()
         try:
-            with redirect_stdout(buffer), redirect_stderr(buffer):
+            if capture_output:
+                with redirect_stdout(buffer), redirect_stderr(buffer):
+                    fn(*args, **kwargs)
+                output = buffer.getvalue()
+                if output:
+                    self._on_line(output if output.endswith("\n") else output + "\n")
+            else:
                 fn(*args, **kwargs)
-            output = buffer.getvalue()
-            if output:
-                self._on_line(output if output.endswith("\n") else output + "\n")
         except SystemExit as exc:
             code = int(exc.code) if isinstance(exc.code, int) else 1
             self._on_line(f"Exited with code {code}\n")
@@ -112,4 +129,6 @@ class CommandRunner:
             code = 1
             self._on_line(f"Error: {exc}\n")
         finally:
+            if on_done:
+                on_done(code)
             self._on_done(code)

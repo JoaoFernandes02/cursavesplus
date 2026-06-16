@@ -29,6 +29,83 @@ profile/**/*.env
 profile/**/secrets*
 """
 
+_git_verbose = False
+
+
+def set_git_verbose(enabled: bool) -> None:
+    """Enable extra git command logging (used by sync --verbose)."""
+    global _git_verbose
+    _git_verbose = enabled
+
+
+def is_git_verbose() -> bool:
+    return _git_verbose or os.environ.get("CURSAVES_DEBUG", "").strip() in ("1", "true", "yes")
+
+
+def _git_error(step: str, result: subprocess.CompletedProcess) -> None:
+    err = (result.stderr or result.stdout or "unknown error").strip()
+    print(f"  Git {step} failed: {err}", file=sys.stderr)
+
+
+def _git_env(sync_dir: Path) -> dict[str, str]:
+    """Environment for git subprocesses (SSH host key accept-new for legacy remotes)."""
+    env = os.environ.copy()
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=str(sync_dir),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            url = result.stdout.strip()
+            if url.startswith("git@") or url.startswith("ssh://"):
+                env["GIT_SSH_COMMAND"] = "ssh -o StrictHostKeyChecking=accept-new"
+    except FileNotFoundError:
+        pass
+    return env
+
+
+def _run_git(
+    sync_dir: Path,
+    args: list[str],
+    *,
+    step: str,
+    timeout: Optional[int] = None,
+    log_failure: bool = True,
+) -> subprocess.CompletedProcess:
+    """Run a git command in *sync_dir* and log failures."""
+    cmd = ["git", *args]
+    env = _git_env(sync_dir)
+    if is_git_verbose():
+        print(f"  $ git {' '.join(args)}", file=sys.stderr)
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(sync_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        if log_failure:
+            print(f"  Git {step} failed: timed out after {timeout}s", file=sys.stderr)
+        return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="timed out")
+    except FileNotFoundError:
+        if log_failure:
+            print(f"  Git {step} failed: git executable not found on PATH", file=sys.stderr)
+        return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="git not found")
+
+    if result.returncode != 0 and log_failure:
+        _git_error(step, result)
+    elif is_git_verbose():
+        out = (result.stdout or result.stderr or "").strip()
+        if out:
+            for line in out.splitlines():
+                print(f"  | {line}", file=sys.stderr)
+    return result
+
 
 def _sync_subdir_paths(snapshots_dir: Path) -> dict[str, Path]:
     """Return local paths for each sync subdirectory under ~/.cursaves/."""
@@ -105,13 +182,14 @@ class GitBackend(SyncBackend):
         apply_git_identity(self.sync_dir)
 
         add_args = [f"{name}/" for name in subdirs]
-        subprocess.run(
-            ["git", "add", *add_args],
-            cwd=str(self.sync_dir), capture_output=True,
-        )
-        result = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
-            cwd=str(self.sync_dir), capture_output=True,
+        add_result = _run_git(self.sync_dir, ["add", *add_args], step="add")
+        if add_result.returncode != 0:
+            return False
+        result = _run_git(
+            self.sync_dir,
+            ["diff", "--cached", "--quiet"],
+            step="diff --cached",
+            log_failure=False,
         )
         if result.returncode == 0:
             return True  # nothing to commit
@@ -119,27 +197,18 @@ class GitBackend(SyncBackend):
         from . import paths
         hostname = paths.get_machine_id()
         msg = f"[{hostname}] sync {message_suffix}"
-        commit_result = subprocess.run(
-            ["git", "commit", "-m", msg],
-            cwd=str(self.sync_dir), capture_output=True, text=True,
-        )
+        commit_result = _run_git(self.sync_dir, ["commit", "-m", msg], step="commit")
         if commit_result.returncode != 0:
-            err = (commit_result.stderr or commit_result.stdout or "unknown error").strip()
-            print(f"  Commit failed: {err}", file=sys.stderr)
             return False
 
         if self.has_remote():
-            try:
-                push_result = subprocess.run(
-                    ["git", "push", "-u", "origin", "main"],
-                    cwd=str(self.sync_dir),
-                    capture_output=True, text=True, timeout=120,
-                )
-                if push_result.returncode != 0:
-                    print(f"  Push failed: {push_result.stderr.strip()}", file=sys.stderr)
-                    return False
-            except subprocess.TimeoutExpired:
-                print("  Push timed out", file=sys.stderr)
+            push_result = _run_git(
+                self.sync_dir,
+                ["push", "-u", "origin", "main"],
+                step="push",
+                timeout=120,
+            )
+            if push_result.returncode != 0:
                 return False
         return True
 
@@ -162,50 +231,39 @@ class GitBackend(SyncBackend):
     def _reset_to_origin(self) -> bool:
         """Fetch + hard-reset to origin/main.  Remote is ground truth."""
         if not self.sync_dir.exists():
+            print(f"  Git pull failed: sync directory missing: {self.sync_dir}", file=sys.stderr)
             return False
 
-        for abort_cmd in (
-            ["git", "rebase", "--abort"],
-            ["git", "merge", "--abort"],
-            ["git", "cherry-pick", "--abort"],
+        for abort_cmd, step in (
+            (["rebase", "--abort"], "rebase --abort"),
+            (["merge", "--abort"], "merge --abort"),
+            (["cherry-pick", "--abort"], "cherry-pick --abort"),
         ):
-            subprocess.run(abort_cmd, cwd=str(self.sync_dir), capture_output=True)
+            _run_git(self.sync_dir, abort_cmd, step=step, log_failure=False)
 
         if not self.has_remote():
-            subprocess.run(
-                ["git", "checkout", "-f", "-B", "main"],
-                cwd=str(self.sync_dir), capture_output=True,
-            )
-            return True
+            result = _run_git(self.sync_dir, ["checkout", "-f", "-B", "main"], step="checkout")
+            return result.returncode == 0
 
-        try:
-            fetch = subprocess.run(
-                ["git", "fetch", "--depth", "1", "origin"],
-                cwd=str(self.sync_dir),
-                capture_output=True, text=True, timeout=180,
-            )
-            if fetch.returncode != 0:
-                return False
-
-            subprocess.run(
-                ["git", "checkout", "-f", "-B", "main", "origin/main"],
-                cwd=str(self.sync_dir), capture_output=True,
-            )
-            subprocess.run(
-                ["git", "reset", "--hard", "origin/main"],
-                cwd=str(self.sync_dir), capture_output=True,
-            )
-            subprocess.run(
-                ["git", "branch", "--set-upstream-to=origin/main", "main"],
-                cwd=str(self.sync_dir), capture_output=True,
-            )
-            subprocess.run(
-                ["git", "clean", "-fd"],
-                cwd=str(self.sync_dir), capture_output=True,
-            )
-            return True
-        except subprocess.TimeoutExpired:
+        fetch = _run_git(
+            self.sync_dir,
+            ["fetch", "--depth", "1", "origin"],
+            step="fetch",
+            timeout=180,
+        )
+        if fetch.returncode != 0:
             return False
+
+        for git_args, step in (
+            (["checkout", "-f", "-B", "main", "origin/main"], "checkout origin/main"),
+            (["reset", "--hard", "origin/main"], "reset --hard origin/main"),
+            (["branch", "--set-upstream-to=origin/main", "main"], "branch --set-upstream-to"),
+            (["clean", "-fd"], "clean"),
+        ):
+            result = _run_git(self.sync_dir, git_args, step=step)
+            if result.returncode != 0:
+                return False
+        return True
 
     def init_repo(self, remote: Optional[str] = None):
         """Create the git repo and optionally add a remote."""
@@ -223,17 +281,16 @@ class GitBackend(SyncBackend):
         gitignore = self.sync_dir / ".gitignore"
         gitignore.write_text(_GITIGNORE_CONTENT)
 
-        subprocess.run(
-            ["git", "add", "."],
-            cwd=str(self.sync_dir), capture_output=True,
-        )
-        commit_result = subprocess.run(
-            ["git", "commit", "-m", "Initialize cursaves sync repo"],
-            cwd=str(self.sync_dir), capture_output=True, text=True,
+        add_result = _run_git(self.sync_dir, ["add", "."], step="add")
+        if add_result.returncode != 0:
+            return
+        commit_result = _run_git(
+            self.sync_dir,
+            ["commit", "-m", "Initialize cursaves sync repo"],
+            step="commit",
         )
         if commit_result.returncode != 0:
-            err = (commit_result.stderr or commit_result.stdout or "unknown error").strip()
-            print(f"  Initial commit failed: {err}", file=sys.stderr)
+            return
 
         if remote:
             subprocess.run(
@@ -243,6 +300,9 @@ class GitBackend(SyncBackend):
 
     def update_remote(self, remote: str):
         """Add or update the origin remote."""
+        from .github_auth import normalize_to_https
+
+        remote = normalize_to_https(remote)
         result = subprocess.run(
             ["git", "remote", "get-url", "origin"],
             cwd=str(self.sync_dir),

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from .. import paths, profile
+from .. import github_auth
 from ..backends import get_backend, get_git_config, load_config
 from ..hook_install import _is_cursaves_hook, _load_hooks_json
 from ..importer import is_cursor_running, list_snapshot_projects
@@ -77,6 +78,15 @@ def get_git_identity() -> dict:
         pass
 
     return identity
+
+
+def get_github_auth() -> dict:
+    """Return GitHub login state from config and gh auth status."""
+    cfg = dict(load_config().get("github", {}))
+    cfg["authenticated"] = github_auth.is_authenticated()
+    if cfg["authenticated"]:
+        cfg["login"] = cfg.get("login") or github_auth.get_auth_status_login()
+    return cfg
 
 
 def hook_is_installed() -> bool:

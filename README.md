@@ -12,16 +12,18 @@ This fork extends the original cursaves with:
 
 | Feature | Description |
 |---------|-------------|
+| **Login with GitHub** | One browser login sets up push/pull auth, commit identity, and HTTPS sync remote via [GitHub CLI](https://cli.github.com/) (`gh`). GUI/setup can auto-install `winget` + `gh` on Windows |
 | **Desktop GUI** | Running `cursaves` with no args opens a CustomTkinter app (Dashboard, Sync, Auto-sync, Profile, Info, Tools, Setup) |
 | **Profile sync** | Sync settings, keybindings, snippets, skills, commands, agents, hooks, and CLI config via the same private remote (`profile push/pull/status`, included in `sync`) |
+| **Git commit identity** | Per-repo identity for `~/.cursaves/` commits (name/email, GPG off by default) — auto-filled from GitHub login or `cursaves config git` |
 | **Windows support** | Full support on Windows (`%APPDATA%` paths, one-click `Install Cursaves.bat`) |
-| **Setup wizard** | `cursaves setup` — interactive first-run (remote, profile, hook) |
+| **Setup wizard** | `cursaves setup` — interactive first-run (GitHub login, remote, profile, hook) |
 | **One-click install** | `Install Cursaves.bat` / `Install Cursaves.command` + bootstrap scripts (`scripts/setup.ps1`, `scripts/setup.sh`) |
 | **Auto-sync on Cursor open** | `cursaves watch --install-hook` — `sessionStart` hook + background `watch --all` daemon |
 | **Desktop shortcuts** | Create shortcuts from the GUI Setup tab |
 | **Interactive TUI** | Fuzzy multi-select for push/pull/copy/purge (`-s` flags, InquirerPy) |
 
-New commands: `setup`, `profile push|pull|status`, `gui`, `watch --install-hook|--uninstall-hook|--all|--detach`.
+New commands: `auth github`, `config git`, `setup`, `profile push|pull|status`, `gui`, `watch --install-hook|--uninstall-hook|--all|--detach`.
 
 Based on [cursaves](https://github.com/Callum-Ward/cursaves) by **Callum Ward** — all upstream features (sync, push/pull, SSH workspaces, doctor, migrate, purge, etc.) are included unchanged.
 
@@ -71,15 +73,76 @@ This means you can sync chats for the same repo across different machines, even 
 
 ## Quick Start
 
+### Recommended: Login with GitHub
+
+One login configures **everything** for the sync repo — same GitHub account for push/pull, commit author, and remote URL (HTTPS, no SSH keys or GPG prompts):
+
 ```bash
 # Install globally (once per machine)
 uv tool install git+https://github.com/JoaoFernandes02/cursavesplus.git
 
-# Initialize with a git remote (once per machine)
-cursaves init --remote git@github.com:you/my-cursaves.git
+# Install GitHub CLI (optional on Windows/macOS — GUI and setup can install automatically)
+# Windows: winget + gh installed for you from Setup → Login with GitHub
+# macOS:   brew install gh  (or auto-install from GUI/setup if Homebrew is present)
+# Linux:   see https://github.com/cli/cli#installation
 
-# Or with an S3 bucket
-cursaves init --backend s3 --bucket my-cursor-saves
+# Login (browser opens) — then choose existing repo or auto-create cursaves-data
+cursaves auth github
+
+# Sync chats + profile
+cursaves sync
+```
+
+**GUI:** run `cursaves` → **Setup** tab → **Login with GitHub**.
+
+Flow in the GUI:
+
+1. A popup shows the **8-character GitHub code**; the browser opens to `github.com/login/device`
+2. Paste the code on GitHub and authorize
+3. After login succeeds, you choose an existing sync repo or let cursaves create `cursaves-data`
+4. Setup status updates to show `@your-github-username`
+
+On **Windows**, if `winget` or `gh` are missing, the GUI asks once and installs both automatically. The CLI (`cursaves auth github`) and `cursaves setup` offer the same install prompt.
+
+**What `auth github` does:**
+
+| Step | Result |
+|------|--------|
+| `gh auth login` | GitHub session for your account |
+| `gh auth setup-git` | Git Credential Manager handles HTTPS push/pull |
+| Profile API | Sets commit author (`user.name` / `user.email`) in `~/.cursaves/` |
+| Remote setup | HTTPS URL on your account (existing or new private `cursaves-data` repo) |
+
+Config is saved to `~/.config/cursaves/config.json` under `github` and `git` (always the same account).
+
+```bash
+cursaves auth github --status     # show @login and remote
+cursaves auth github --logout     # sign out
+cursaves auth github --remote URL # use an existing private repo
+cursaves auth github --create-repo
+```
+
+### Alternative: full setup wizard
+
+```bash
+cursaves setup          # interactive (includes GitHub login)
+cursaves setup --yes    # non-interactive defaults (requires gh already logged in)
+```
+
+### Legacy: manual git / SSH
+
+If you prefer SSH or a custom setup without `gh`:
+
+```bash
+cursaves init --remote git@github.com:you/cursaves-data.git
+cursaves config git --name "You" --email "you@example.com" --no-sign
+```
+
+Or HTTPS without `gh` (use Git Credential Manager when prompted):
+
+```bash
+cursaves init --remote https://github.com/you/cursaves-data.git
+cursaves config git --name "You" --email "you@example.com" --no-sign
 ```
 
 Then from any project directory:
@@ -87,6 +150,10 @@ Then from any project directory:
 ```bash
 # Automatic bidirectional sync (pull behind + push ahead)
 cursaves sync
+
+# Verbose git output if sync fails
+cursaves sync --verbose
+# or: set CURSAVES_DEBUG=1
 
 # Or manually:
 cursaves push              # save and push to remote
@@ -136,7 +203,7 @@ cadfb263-3326-4aff-8887-dcc12f736b11     Feedback on documentation...   agent   
 
 ## Installation
 
-**Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/), macOS or Linux, Git (for git backend). Zero required Python dependencies.
+**Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/), macOS/Linux/Windows, Git, [GitHub CLI](https://cli.github.com/) (`gh`) for Login with GitHub.
 
 **Tested with:** Cursor 2.6–3.0 (supports both old and new chat storage formats)
 
@@ -177,20 +244,38 @@ python -m cursor_saves <command>
 
 ## Setup
 
-`cursaves` stores conversation snapshots locally at `~/.cursaves/snapshots/`. To sync between machines, you configure a **backend** — either a git remote or an S3 bucket.
+`cursaves` stores conversation snapshots locally at `~/.cursaves/snapshots/`. To sync between machines, configure a **backend** — git (default) or S3.
 
-### Option A: Git backend (default)
+### Option A: Git backend + Login with GitHub (recommended)
+
+1. On each machine, open the GUI (**Setup → Login with GitHub**) or run `cursaves auth github`. On Windows, cursaves can install `winget` and `gh` for you if they are missing.
+2. You'll be asked whether you already have a private sync repo. If not, cursaves creates `https://github.com/<you>/cursaves-data` automatically.
+3. Run `cursaves sync` from any project directory.
+
+**One account, three roles:** the same GitHub login handles remote authentication (push/pull), commit author identity, and repo access. GPG signing is disabled for the sync repo by default (avoids passphrase prompts).
+
+To inspect or change commit identity without re-login:
+
+```bash
+cursaves config git --show
+cursaves config git --name "You" --email "you@example.com" --no-sign
+```
+
+### Option B: Git backend (manual / SSH)
 
 1. Create a **private** repository on GitHub/GitLab (empty, no README).
 2. Initialize on each machine:
 
 ```bash
 cursaves init --remote git@github.com:you/cursaves-data.git
+cursaves config git --name "You" --email "you@example.com" --no-sign
 ```
 
-This creates `~/.cursaves/` with a git repo and the remote configured. If you only want local checkpoints (no syncing), run `cursaves init` without `--remote`.
+This creates `~/.cursaves/` with a git repo and the remote configured. Commit identity is stored locally in the sync repo only (does not change your global git config).
 
-### Option B: S3 backend
+If you only want local checkpoints (no syncing), run `cursaves init` without `--remote`.
+
+### Option C: S3 backend
 
 1. Create an S3 bucket (private).
 2. Configure AWS credentials (`aws configure`, env vars, or IAM role).
@@ -224,10 +309,14 @@ All commands default to the current working directory as the project path. Use `
 | Command      | Description                                                 | Modifies Cursor data? |
 | ------------ | ----------------------------------------------------------- | --------------------- |
 | **`sync`**     | **Pull behind + push ahead — one command to stay in sync**  | Yes                   |
+| **`sync -v`**  | **Same as sync, with verbose git command logging**          | Yes                   |
+| **`auth github`** | **Login with GitHub — auth + identity + remote**         | No                    |
+| **`config git`** | **Set/show commit identity for ~/.cursaves/**             | No                    |
 | **`push`**     | **Checkpoint + push to remote**                             | No                    |
 | **`push -s`**  | **Interactively select which conversations to push**        | No                    |
 | **`pull`**     | **Pull from remote + import snapshots**                     | Yes                   |
-| `init`         | Initialize sync (git remote, S3 bucket, etc.)               | No                    |
+| `setup`        | Interactive first-run wizard (GitHub login, profile, hook) | No                    |
+| `init`         | Initialize sync repo (git remote or S3 bucket)              | No                    |
 | `workspaces`   | List all Cursor workspaces (local, SSH, custom) with hash   | No                    |
 | `list`         | Show conversations for a project                            | No                    |
 | `snapshots`    | List snapshot projects available in ~/.cursaves/           | No                    |
@@ -243,7 +332,27 @@ All commands default to the current working directory as the project path. Use `
 | `migrate`      | Migrate old chats to Cursor 3.0 global index                | Yes                   |
 | `purge`        | Delete chats from Cursor's DB to reclaim disk space         | Yes                   |
 
-Most of the time you only need `sync`. Use `push -s` when you want to push specific conversations. Use `repair` if you get "Blob not found" errors after importing. Use `doctor` to find and recover orphaned chats. Use `migrate` after updating to Cursor 3.0 to make all old chats visible in the sidebar. Use `purge` to delete chats and reclaim disk space (requires Cursor to be closed). Use `delete` to clean up snapshots you no longer need.
+Most of the time you only need `sync`. On a new machine, run `cursaves auth github` once, then `sync`. Use `push -s` when you want to push specific conversations. Use `repair` if you get "Blob not found" errors after importing. Use `doctor` to find and recover orphaned chats. Use `migrate` after updating to Cursor 3.0 to make all old chats visible in the sidebar. Use `purge` to delete chats and reclaim disk space (requires Cursor to be closed). Use `delete` to clean up snapshots you no longer need.
+
+### Git sync troubleshooting
+
+If `cursaves sync` fails with a git error:
+
+```bash
+cursaves sync --verbose          # show git commands and stderr
+# or
+set CURSAVES_DEBUG=1             # Windows
+export CURSAVES_DEBUG=1          # macOS/Linux
+cursaves sync
+```
+
+| Error | Fix |
+|-------|-----|
+| `Host key verification failed` | Use `cursaves auth github` (HTTPS) instead of SSH, or run `ssh-keyscan github.com >> ~/.ssh/known_hosts` |
+| `Could not read from remote` | Run `cursaves auth github` or check repo access with `gh repo view you/cursaves-data` |
+| GPG / signing prompts | Run `cursaves config git --no-sign` or re-run `cursaves auth github` (GPG disabled for sync repo) |
+| Not logged in | `cursaves auth github --status` then `cursaves auth github` |
+| `gh` / `winget` not found | Use **Setup → Login with GitHub** in the GUI (auto-installs on Windows), or `cursaves auth github` / `cursaves setup` |
 
 ### Auto-sync with `watch`
 
@@ -321,8 +430,9 @@ Snapshot files contain your **full conversation data**: your prompts, AI respons
 # On Machine A -- before switching:
 cursaves sync       # pushes your ahead conversations
 
-# On Machine B -- after switching:
-cursaves sync       # pulls the latest, pushes anything ahead locally
+# On Machine B -- first time on this machine:
+cursaves auth github   # one-time login (same GitHub account)
+cursaves sync          # pulls the latest, pushes anything ahead locally
 # Then restart Cursor (quit and reopen) to see the imported conversations
 ```
 
@@ -413,8 +523,26 @@ The daemon handles checkpoint + git push/pull automatically. When you switch mac
   .git/                        # Present when using git backend
 
 ~/.config/cursaves/
-  config.json                  # Backend configuration (git, s3, etc.)
+  config.json                  # Backend + GitHub login + git commit identity
   sync_state.json              # Tracks handled diverged snapshots
+
+# Example config.json after Login with GitHub:
+# {
+#   "backend": "git",
+#   "github": {
+#     "login": "you",
+#     "name": "Your Name",
+#     "email": "you@example.com",
+#     "remote_url": "https://github.com/you/cursaves-data.git",
+#     "repo": "cursaves-data"
+#   },
+#   "git": {
+#     "name": "Your Name",
+#     "email": "you@example.com",
+#     "sign_commits": false
+#   },
+#   "profile": { ... }
+# }
 
 ~/.local/bin/cursaves          # Global CLI tool (installed via uv)
 
@@ -425,7 +553,7 @@ cursaves/                      # Source repo (this repo, public)
   LICENSE
 ```
 
-The tool code (this repo) is separate from your conversation data (`~/.cursaves/`). Install the tool once, point it at a private remote (git or S3), and sync from any project directory.
+The tool code (this repo) is separate from your conversation data (`~/.cursaves/`). Install the tool once, run `cursaves auth github` (or point at a private remote manually), and sync from any project directory.
 
 ## Contributing
 
@@ -449,7 +577,7 @@ If you find this useful, consider buying me a coffee:
 **Cursaves+** is a fork of [cursaves](https://github.com/Callum-Ward/cursaves).
 
 - **Original author:** [Callum Ward](https://github.com/Callum-Ward) — created cursaves and holds copyright on the original work
-- **Fork:** [JoaoFernandes02/cursavesplus](https://github.com/JoaoFernandes02/cursavesplus) — GUI, profile sync, Windows support, and other enhancements listed above
+- **Fork:** [JoaoFernandes02/cursavesplus](https://github.com/JoaoFernandes02/cursavesplus) — GUI, profile sync, Login with GitHub, Windows support, and other enhancements listed above
 
 This project is a derivative work of cursaves. Source code from the original project is used under the terms of the [AGPL-3.0](LICENSE) license. See the [original repository](https://github.com/Callum-Ward/cursaves) for the upstream project.
 

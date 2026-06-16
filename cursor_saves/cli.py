@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import __version__, db, export, paths, profile, setup_wizard
+from . import github_auth
 from .backends import (
     GitBackend,
     S3Backend,
@@ -22,6 +23,7 @@ from .backends import (
     read_global_git_identity,
     save_config,
     save_git_config,
+    set_git_verbose,
 )
 from .importer import (
     copy_between_workspaces,
@@ -275,6 +277,52 @@ def cmd_snapshots(args):
     print(f"\nUse 'cursaves pull -s' to interactively select which to import.")
 
 
+def cmd_auth_github(args):
+    """Login with GitHub — auth, commit identity, and sync remote."""
+    if getattr(args, "status", False):
+        github_auth.print_auth_status()
+        return
+    if getattr(args, "logout", False):
+        github_auth.logout()
+        return
+    if not github_auth.find_gh():
+        yes = getattr(args, "yes", False)
+        if github_auth.can_auto_install_gh():
+            do_install = yes
+            if not yes and not getattr(args, "remote", None):
+                from .interactive import confirm
+                do_install = confirm(
+                    "GitHub CLI (gh) not found. Install now?\n"
+                    f"  {github_auth.gh_auto_install_description()}",
+                    default=True,
+                )
+            if do_install:
+                ok, msg = github_auth.install_gh()
+                print(msg)
+                if not ok or not github_auth.find_gh():
+                    sys.exit(1)
+            else:
+                github_auth.ensure_gh()
+        else:
+            github_auth.ensure_gh()
+    github_auth.run_auth_flow(
+        login_only=getattr(args, "login_only", False),
+        remote_url=getattr(args, "remote", None),
+        create_repo=getattr(args, "create_repo", False),
+        yes=getattr(args, "yes", False),
+        interactive=not getattr(args, "yes", False) and not getattr(args, "remote", None),
+    )
+
+
+def cmd_auth(args):
+    """Authentication subcommands."""
+    if args.auth_command == "github":
+        cmd_auth_github(args)
+    else:
+        print("Error: unknown auth command.", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_init(args):
     """Initialize cursaves sync — git repo or S3 bucket."""
     sync_dir = paths.get_sync_dir()
@@ -332,6 +380,10 @@ def cmd_init(args):
         return
 
     # Git backend (default / backward-compatible)
+    remote = args.remote or load_config().get("github", {}).get("remote_url")
+    if remote:
+        remote = github_auth.normalize_to_https(remote)
+
     if paths.is_sync_repo_initialized():
         config = load_config()
         if config.get("backend") == "s3":
@@ -345,9 +397,9 @@ def cmd_init(args):
 
         git_backend = GitBackend(sync_dir)
         print(f"Sync repo already initialized at {sync_dir}")
-        if args.remote:
-            git_backend.update_remote(args.remote)
-            print(f"  Remote updated: {args.remote}")
+        if remote:
+            git_backend.update_remote(remote)
+            print(f"  Remote updated: {remote}")
         _save_git_identity_from_args(args)
         if paths.is_sync_repo_initialized():
             apply_git_identity(sync_dir)
@@ -356,16 +408,16 @@ def cmd_init(args):
     print(f"Initializing sync repo at {sync_dir}...")
     _save_git_identity_from_args(args)
     git_backend = GitBackend(sync_dir)
-    git_backend.init_repo(remote=args.remote)
+    git_backend.init_repo(remote=remote)
     _ensure_profile_config()
     print(f"  Created {sync_dir}")
 
-    if args.remote:
-        print(f"  Added remote: {args.remote}")
+    if remote:
+        print(f"  Added remote: {remote}")
         print(f"\nDone. Run 'cursaves push' from any project directory to start syncing.")
     else:
-        print(f"\nDone. To sync between machines, add a remote:")
-        print(f"  cursaves init --remote git@github.com:you/my-cursaves.git")
+        print(f"\nDone. To sync between machines, run:")
+        print(f"  cursaves auth github")
         print(f"  cursaves init --backend s3 --bucket my-cursor-saves")
 
 
@@ -1047,6 +1099,10 @@ def cmd_config(args):
         sys.exit(1)
 
 
+def _configure_git_verbose(args) -> None:
+    set_git_verbose(bool(getattr(args, "verbose", False)))
+
+
 def _profile_export_push(backend: SyncBackend, snapshots_dir: Path) -> bool:
     """Export local Cursor profile and push before remote pull."""
     _configure_stdio()
@@ -1058,7 +1114,11 @@ def _profile_export_push(backend: SyncBackend, snapshots_dir: Path) -> bool:
         if backend.has_remote():
             print("  Pushing profile...", end="", flush=True)
             ok = backend.push_profile(snapshots_dir)
-            print(" done" if ok else " failed", flush=True)
+            if ok:
+                print(" done", flush=True)
+            else:
+                print(" failed", file=sys.stderr)
+                print("  See git errors above.", file=sys.stderr)
             return ok
         print("  No remote configured, profile saved locally only")
     elif exported:
@@ -1080,6 +1140,7 @@ def _profile_apply_after_pull() -> int:
 
 def cmd_profile_push(args):
     """Export local Cursor profile and push to remote."""
+    _configure_git_verbose(args)
     _require_sync_repo()
     _ensure_profile_config()
     backend = get_backend()
@@ -1094,6 +1155,7 @@ def cmd_profile_push(args):
             print(" done")
         else:
             print(" failed", file=sys.stderr)
+            print("  See git errors above.", file=sys.stderr)
             sys.exit(1)
     else:
         print("No remote configured — profile saved to ~/.cursaves/profile/")
@@ -1101,6 +1163,7 @@ def cmd_profile_push(args):
 
 def cmd_profile_pull(args):
     """Pull remote profile and apply to local Cursor paths."""
+    _configure_git_verbose(args)
     _require_sync_repo()
     _ensure_profile_config()
     backend = get_backend()
@@ -1112,6 +1175,7 @@ def cmd_profile_pull(args):
             print(" done")
         else:
             print(" failed", file=sys.stderr)
+            print("  See git errors above.", file=sys.stderr)
             sys.exit(1)
     else:
         print("No remote configured, applying local profile mirror only.")
@@ -1143,6 +1207,7 @@ def cmd_setup(args):
 def cmd_sync(args):
     """Pull behind conversations then push ahead ones — fully automatic."""
     _configure_stdio()
+    _configure_git_verbose(args)
     sync_dir = _require_sync_repo()
     _ensure_profile_config()
     backend = get_backend()
@@ -1160,6 +1225,7 @@ def cmd_sync(args):
             print(" done")
         else:
             print(" failed", file=sys.stderr)
+            print("  Hint: run with --verbose or set CURSAVES_DEBUG=1 for git command details.", file=sys.stderr)
             return
 
     if _profile_sync_enabled(args):
@@ -1201,6 +1267,7 @@ def cmd_sync(args):
 
 def cmd_push(args):
     """Checkpoint + push in one command."""
+    _configure_git_verbose(args)
     sync_dir = _require_sync_repo()
     backend = get_backend()
     snapshots_dir = paths.get_snapshots_dir()
@@ -1291,13 +1358,14 @@ def _backend_pull() -> bool:
     if backend.pull(snapshots_dir):
         print(" done")
         return True
-    else:
-        print(" failed", file=sys.stderr)
-        return False
+    print(" failed", file=sys.stderr)
+    print("  Hint: run with --verbose or set CURSAVES_DEBUG=1 for git command details.", file=sys.stderr)
+    return False
 
 
 def cmd_pull(args):
     """Pull + import snapshots in one command."""
+    _configure_git_verbose(args)
     sync_dir = _require_sync_repo()
 
     # Step 1: Pull from remote
@@ -2123,6 +2191,39 @@ def main():
     )
     p_config_git.set_defaults(func=cmd_config)
 
+    # ── auth ──────────────────────────────────────────────────────
+    p_auth = subparsers.add_parser("auth", help="Authenticate with external services")
+    auth_sub = p_auth.add_subparsers(dest="auth_command")
+
+    p_auth_github = auth_sub.add_parser(
+        "github", help="Login with GitHub (push/pull auth + commit identity + remote)"
+    )
+    p_auth_github.add_argument(
+        "--status", action="store_true",
+        help="Show GitHub login and sync remote status",
+    )
+    p_auth_github.add_argument(
+        "--logout", action="store_true",
+        help="Log out from GitHub",
+    )
+    p_auth_github.add_argument(
+        "--login-only", action="store_true",
+        help="Login and save identity only, do not configure remote",
+    )
+    p_auth_github.add_argument(
+        "--remote", "-r",
+        help="Use an existing GitHub HTTPS remote URL",
+    )
+    p_auth_github.add_argument(
+        "--create-repo", action="store_true",
+        help="Create private cursaves-data repo on your account",
+    )
+    p_auth_github.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Non-interactive: auto-create repo if needed",
+    )
+    p_auth_github.set_defaults(func=cmd_auth)
+
     # ── workspaces ─────────────────────────────────────────────────
     p_workspaces = subparsers.add_parser(
         "workspaces", help="List all Cursor workspaces (local and SSH remote)"
@@ -2186,6 +2287,10 @@ def main():
         "--ahead", "-a", action="store_true",
         help="Find and push all conversations ahead of snapshots across all workspaces",
     )
+    p_push.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Print git commands and output during push",
+    )
     p_push.set_defaults(func=cmd_push)
 
     # ── pull ────────────────────────────────────────────────────────
@@ -2209,6 +2314,10 @@ def main():
         "--reload", action="store_true",
         help="(deprecated, no effect) Cursor requires a full restart to see imports",
     )
+    p_pull.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Print git commands and output during pull",
+    )
     p_pull.set_defaults(func=cmd_pull)
 
     # ── sync ──────────────────────────────────────────────────────
@@ -2218,6 +2327,10 @@ def main():
     p_sync.add_argument(
         "--no-profile", action="store_true",
         help="Skip global Cursor profile sync (settings, skills, hooks, etc.)",
+    )
+    p_sync.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Print git commands and output during sync",
     )
     p_sync.set_defaults(func=cmd_sync)
 
@@ -2230,10 +2343,18 @@ def main():
     p_profile_push = profile_sub.add_parser(
         "push", help="Export local Cursor config and push to remote"
     )
+    p_profile_push.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Print git commands and output",
+    )
     p_profile_push.set_defaults(func=cmd_profile_push)
 
     p_profile_pull = profile_sub.add_parser(
         "pull", help="Pull remote profile and apply to this machine"
+    )
+    p_profile_pull.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Print git commands and output",
     )
     p_profile_pull.set_defaults(func=cmd_profile_pull)
 

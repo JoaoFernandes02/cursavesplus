@@ -15,6 +15,7 @@ from typing import Optional
 from InquirerPy import inquirer
 
 from . import paths, profile
+from . import github_auth
 from .backends import (
     GitBackend,
     S3Backend,
@@ -40,6 +41,8 @@ class SetupOptions:
     git_name: Optional[str] = None
     git_email: Optional[str] = None
     git_sign_commits: bool = False
+    github_login: Optional[str] = None
+    use_manual_git: bool = False
 
 
 def _cursor_user_dir_path() -> Optional[Path]:
@@ -152,8 +155,76 @@ def _prompt_existing_action() -> Optional[str]:
     return choice if isinstance(choice, str) else None
 
 
-def _prompt_git_identity(options: SetupOptions, args) -> bool:
-    """Collect git commit identity for the sync repo. Returns False if cancelled."""
+def _prompt_github_auth(options: SetupOptions, args) -> bool:
+    """Login with GitHub for unified push auth + commit identity + remote."""
+    if getattr(args, "remote", None):
+        options.remote = github_auth.normalize_to_https(args.remote)
+
+    use_defaults = getattr(args, "yes", False)
+
+    if use_defaults:
+        if github_auth.find_gh() and github_auth.is_authenticated():
+            print("\n── GitHub ──")
+            cfg = github_auth.run_auth_flow(
+                remote_url=options.remote,
+                create_repo=not options.remote,
+                yes=True,
+                interactive=False,
+            )
+            options.remote = cfg.get("remote_url") or options.remote
+            options.git_name = cfg.get("name")
+            options.git_email = cfg.get("email")
+            options.github_login = cfg.get("login")
+            options.git_sign_commits = False
+            return True
+        global_id = read_global_git_identity()
+        options.git_name = global_id.get("name")
+        options.git_email = global_id.get("email")
+        options.git_sign_commits = False
+        if not options.git_name or not options.git_email:
+            print(
+                "Warning: not logged in to GitHub and no global git identity. "
+                "Run: cursaves auth github",
+                file=sys.stderr,
+            )
+        return True
+
+    if not confirm("Login with GitHub? (recommended — sets up push, commits, and remote)", default=True):
+        return _prompt_git_identity_manual(options, args)
+
+    print("\n── GitHub login ──")
+    if not github_auth.find_gh():
+        if github_auth.can_auto_install_gh() and confirm(
+            f"GitHub CLI (gh) not found. Install now?\n  {github_auth.gh_auto_install_description()}",
+            default=True,
+        ):
+            ok, msg = github_auth.install_gh()
+            print(f"  {msg}")
+            if not ok or not github_auth.find_gh():
+                if confirm("Continue with manual git configuration instead?", default=False):
+                    return _prompt_git_identity_manual(options, args)
+                sys.exit(1)
+        else:
+            print(f"GitHub CLI (gh) not found. Install with: {github_auth.gh_install_hint()}")
+            if confirm("Continue with manual git configuration instead?", default=False):
+                return _prompt_git_identity_manual(options, args)
+            sys.exit(1)
+
+    cfg = github_auth.run_auth_flow(
+        remote_url=options.remote,
+        interactive=not options.remote,
+    )
+    options.remote = cfg.get("remote_url") or options.remote
+    options.git_name = cfg.get("name")
+    options.git_email = cfg.get("email")
+    options.github_login = cfg.get("login")
+    options.git_sign_commits = False
+    return True
+
+
+def _prompt_git_identity_manual(options: SetupOptions, args) -> bool:
+    """Legacy manual git identity (no GitHub login)."""
+    options.use_manual_git = True
     if getattr(args, "git_name", None):
         options.git_name = args.git_name
     if getattr(args, "git_email", None):
@@ -165,14 +236,6 @@ def _prompt_git_identity(options: SetupOptions, args) -> bool:
         return True
 
     global_id = read_global_git_identity()
-    use_defaults = getattr(args, "yes", False)
-
-    if use_defaults:
-        options.git_name = global_id.get("name")
-        options.git_email = global_id.get("email")
-        options.git_sign_commits = False
-        return True
-
     global_label = ""
     if global_id.get("name") or global_id.get("email"):
         global_label = (
@@ -187,6 +250,7 @@ def _prompt_git_identity(options: SetupOptions, args) -> bool:
             options.git_email = global_id.get("email")
             options.git_sign_commits = False
             print("  GPG signing disabled for sync repo commits.")
+            print("  Warning: manual mode — ensure git credentials match this identity.")
             return True
 
     options.git_name = _prompt_text(
@@ -206,6 +270,11 @@ def _prompt_git_identity(options: SetupOptions, args) -> bool:
     return True
 
 
+def _prompt_git_identity(options: SetupOptions, args) -> bool:
+    """Collect git commit identity for the sync repo. Returns False if cancelled."""
+    return _prompt_github_auth(options, args)
+
+
 def prompt_setup_options(args) -> Optional[SetupOptions]:
     """Collect setup options interactively or from CLI flags."""
     use_defaults = getattr(args, "yes", False)
@@ -223,21 +292,7 @@ def prompt_setup_options(args) -> Optional[SetupOptions]:
 
     if options.backend == "git":
         if getattr(args, "remote", None):
-            options.remote = args.remote
-        elif use_defaults:
-            options.remote = None
-        else:
-            if confirm(
-                "Configure a git remote to sync between your devices?",
-                default=True,
-            ):
-                options.remote = _prompt_text(
-                    "Git remote URL (your private repo for syncing between your devices):"
-                )
-                if not options.remote:
-                    return None
-            else:
-                options.remote = None
+            options.remote = github_auth.normalize_to_https(args.remote)
     else:
         if getattr(args, "bucket", None):
             options.bucket = args.bucket
@@ -365,11 +420,16 @@ def _run_init(options: SetupOptions) -> None:
         )
     else:
         git_backend = GitBackend(sync_dir)
-        git_backend.init_repo(remote=options.remote)
+        if git_backend.is_initialized():
+            if options.remote:
+                git_backend.update_remote(options.remote)
+                print(f"  Updated remote: {options.remote}")
+        else:
+            git_backend.init_repo(remote=options.remote)
+            print(f"  Created {sync_dir}")
+            if options.remote:
+                print(f"  Added remote: {options.remote}")
         _save_profile_config(options)
-        print(f"  Created {sync_dir}")
-        if options.remote:
-            print(f"  Added remote: {options.remote}")
 
 
 def _run_initial_sync(options: SetupOptions) -> None:
@@ -407,13 +467,15 @@ def print_summary(options: SetupOptions) -> None:
         print("\nNo remote configured — local-only mode. Add later with:")
         print("  cursaves init --remote git@github.com:you/your-cursaves-data.git")
     if options.backend == "git":
-        if options.git_name and options.git_email:
+        if options.github_login:
+            print(f"\nGitHub: @{options.github_login}")
+            print(f"  Push/pull + commit identity: {options.git_name} <{options.git_email}>")
+        elif options.git_name and options.git_email:
             print(f"\nGit commit identity: {options.git_name} <{options.git_email}>")
             print("  GPG signing: disabled for sync repo")
         else:
             print(
-                "\nWarning: no git identity configured for sync commits. "
-                "Run: cursaves config git --name \"...\" --email \"...\""
+                "\nWarning: no git identity configured. Run: cursaves auth github"
             )
     print(f"Local data: {paths.get_sync_dir()}")
 
@@ -437,7 +499,8 @@ def run_setup(args) -> None:
         if options.init_action == "update_remote" and not verify_remote(options.remote):
             sys.exit(1)
     elif options.backend == "git" and not options.remote and options.init_action == "init":
-        print("\nSkipping remote verification (local-only setup).")
+        if options.use_manual_git:
+            print("\nSkipping remote verification (local-only setup).")
 
     _run_init(options)
 
