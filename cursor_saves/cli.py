@@ -1119,6 +1119,7 @@ def cmd_config_sync(args):
     if args.show:
         sync = get_sync_config()
         print("Sync lifecycle settings (~/.config/cursaves/config.json):")
+        print(f"  chat_enabled:          {sync.get('chat_enabled')}")
         print(f"  retention_days:        {sync.get('retention_days')} (0 = off)")
         print(f"  retention_purge_local: {sync.get('retention_purge_local')}")
         pinned = sync.get("pinned_composers") or []
@@ -1140,16 +1141,20 @@ def cmd_config_sync(args):
         updates["retention_days"] = args.retention_days
     if args.retention_purge_local is not None:
         updates["retention_purge_local"] = args.retention_purge_local
+    if args.chat_enabled is not None:
+        updates["chat_enabled"] = args.chat_enabled
 
     if not updates:
         print(
-            "Error: specify --retention-days, --retention-purge-local, or --show.",
+            "Error: specify --retention-days, --retention-purge-local, "
+            "--chat-enabled, --no-chat-enabled, or --show.",
             file=sys.stderr,
         )
         sys.exit(1)
 
     sync = save_sync_config(updates)
     print("Sync settings saved:")
+    print(f"  chat_enabled:          {sync.get('chat_enabled')}")
     print(f"  retention_days:        {sync.get('retention_days')}")
     print(f"  retention_purge_local: {sync.get('retention_purge_local')}")
 
@@ -1321,6 +1326,60 @@ def cmd_profile_status(args):
         print("Run 'cursaves profile push' to upload or 'cursaves profile pull' to apply remote.")
     elif any(r["state"] != "missing" for r in rows):
         print("\nProfile mirror matches local Cursor config.")
+    behind = [r for r in rows if r["state"] == "local_behind"]
+    if behind:
+        print(f"\n{len(behind)} item(s) are behind the repo (local deletions are not synced).")
+        print("Run 'cursaves profile pull' to restore from remote.")
+
+
+def cmd_skills(args):
+    """List or delete synced skills."""
+    from . import skills_hooks
+
+    _require_sync_repo()
+    if args.skills_command == "list":
+        rows = skills_hooks.list_skills()
+        print(skills_hooks.format_skills_list(rows))
+        return
+    if args.skills_command == "delete":
+        if not args.name:
+            print("Error: specify skill name to delete.", file=sys.stderr)
+            sys.exit(1)
+        if not getattr(args, "yes", False):
+            print(f"Delete skill '{args.name}' from local and sync repo? [y/N] ", end="")
+            if input().strip().lower() not in ("y", "yes"):
+                print("Cancelled.")
+                return
+        if skills_hooks.delete_skill(args.name):
+            print(f"Deleted skill '{args.name}' and pushed to remote.")
+        else:
+            print(f"Skill '{args.name}' not found.", file=sys.stderr)
+            sys.exit(1)
+
+
+def cmd_hooks(args):
+    """List or delete synced hooks."""
+    from . import skills_hooks
+
+    _require_sync_repo()
+    if args.hooks_command == "list":
+        rows = skills_hooks.list_hooks()
+        print(skills_hooks.format_hooks_list(rows))
+        return
+    if args.hooks_command == "delete":
+        if not args.name:
+            print("Error: specify hook name or command to delete.", file=sys.stderr)
+            sys.exit(1)
+        if not getattr(args, "yes", False):
+            print(f"Delete hook '{args.name}' from local and sync repo? [y/N] ", end="")
+            if input().strip().lower() not in ("y", "yes"):
+                print("Cancelled.")
+                return
+        if skills_hooks.delete_hook(args.name):
+            print(f"Deleted hook '{args.name}' and pushed to remote.")
+        else:
+            print(f"Hook '{args.name}' not found.", file=sys.stderr)
+            sys.exit(1)
 
 
 def cmd_setup(args):
@@ -1347,6 +1406,8 @@ def _apply_retention_prune(verbose: bool = False) -> int:
 
 def cmd_sync(args):
     """Pull behind conversations then push ahead ones — fully automatic."""
+    from .chat_lifecycle import is_chat_sync_enabled
+
     _configure_stdio()
     _configure_git_verbose(args)
     sync_dir = _require_sync_repo()
@@ -1354,6 +1415,9 @@ def cmd_sync(args):
     backend = get_backend()
     snapshots_dir = paths.get_snapshots_dir()
     profile_applied = 0
+    chat_sync = is_chat_sync_enabled()
+    imported = 0
+    pushed = 0
 
     if _profile_sync_enabled(args):
         if not _profile_export_push(backend, snapshots_dir):
@@ -1373,24 +1437,27 @@ def cmd_sync(args):
         print("\n── Profile apply ──")
         profile_applied = _profile_apply_after_pull()
 
-    # Step 2: Import — pull behind conversations from snapshots into Cursor DBs
-    print("\n── Pull ──")
-    imported = _pull_behind(sync_dir)
-    if imported > 0:
-        print(f"  Imported {imported} conversation(s)")
+    if chat_sync:
+        # Step 2: Import — pull behind conversations from snapshots into Cursor DBs
+        print("\n── Pull ──")
+        imported = _pull_behind(sync_dir)
+        if imported > 0:
+            print(f"  Imported {imported} conversation(s)")
+        else:
+            print("  Everything up to date")
+
+        # Step 3: Retention — prune old snapshots before push
+        pruned = _apply_retention_prune(verbose=getattr(args, "verbose", False))
+        if pruned > 0 and not getattr(args, "verbose", False):
+            print(f"  Retention: pruned {pruned} expired snapshot(s)")
+
+        # Step 4: Push — export conversations from Cursor DBs into snapshots
+        print("\n── Push ──")
+        pushed = _push_ahead(sync_dir, auto=True, backend=backend)
+        if pushed == 0:
+            print("  Nothing to push")
     else:
-        print("  Everything up to date")
-
-    # Step 3: Retention — prune old snapshots before push
-    pruned = _apply_retention_prune(verbose=getattr(args, "verbose", False))
-    if pruned > 0 and not getattr(args, "verbose", False):
-        print(f"  Retention: pruned {pruned} expired snapshot(s)")
-
-    # Step 4: Push — export conversations from Cursor DBs into snapshots
-    print("\n── Push ──")
-    pushed = _push_ahead(sync_dir, auto=True, backend=backend)
-    if pushed == 0:
-        print("  Nothing to push")
+        print("\n── Chat sync disabled (sync.chat_enabled=false) ──")
 
     # Summary
     print()
@@ -2363,6 +2430,19 @@ def main():
         action="store_true",
         help="Show current sync lifecycle settings",
     )
+    p_config_sync.add_argument(
+        "--chat-enabled",
+        action="store_true",
+        default=None,
+        dest="chat_enabled",
+        help="Enable automatic chat sync in cursaves sync / watch",
+    )
+    p_config_sync.add_argument(
+        "--no-chat-enabled",
+        action="store_false",
+        dest="chat_enabled",
+        help="Disable automatic chat sync (default)",
+    )
     p_config_sync.set_defaults(func=cmd_config)
 
     # ── remove ────────────────────────────────────────────────────
@@ -2575,6 +2655,36 @@ def main():
         "status", help="Show local vs profile mirror status"
     )
     p_profile_status.set_defaults(func=cmd_profile_status)
+
+    # ── skills ────────────────────────────────────────────────────
+    p_skills = subparsers.add_parser("skills", help="List or delete synced skills")
+    skills_sub = p_skills.add_subparsers(dest="skills_command")
+
+    p_skills_list = skills_sub.add_parser("list", help="List skills in sync repo")
+    p_skills_list.set_defaults(func=cmd_skills)
+
+    p_skills_delete = skills_sub.add_parser("delete", help="Delete a skill from local and repo")
+    p_skills_delete.add_argument("name", help="Skill directory name")
+    p_skills_delete.add_argument(
+        "--yes", "-y", action="store_true", help="Skip confirmation prompt"
+    )
+    p_skills_delete.set_defaults(func=cmd_skills)
+
+    # ── hooks ─────────────────────────────────────────────────────
+    p_hooks = subparsers.add_parser("hooks", help="List or delete synced hooks")
+    hooks_sub = p_hooks.add_subparsers(dest="hooks_command")
+
+    p_hooks_list = hooks_sub.add_parser("list", help="List hooks in sync repo")
+    p_hooks_list.set_defaults(func=cmd_hooks)
+
+    p_hooks_delete = hooks_sub.add_parser("delete", help="Delete a hook from local and repo")
+    p_hooks_delete.add_argument(
+        "name", help="Hook script filename or hooks.json command path"
+    )
+    p_hooks_delete.add_argument(
+        "--yes", "-y", action="store_true", help="Skip confirmation prompt"
+    )
+    p_hooks_delete.set_defaults(func=cmd_hooks)
 
     # ── repair ─────────────────────────────────────────────────────
     p_repair = subparsers.add_parser(

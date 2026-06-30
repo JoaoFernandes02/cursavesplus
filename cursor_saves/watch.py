@@ -132,21 +132,27 @@ def _run_full_sync(git_sync: bool = True, verbose: bool = False) -> tuple[int, i
         if applied > 0:
             print(f"[{_now()}] Applied {applied} profile item(s) from remote")
 
-    imported = _pull_behind(sync_dir)
-    if imported > 0:
-        print(f"[{_now()}] Imported {imported} conversation(s) from remote")
+    from .chat_lifecycle import is_chat_sync_enabled
 
-    pruned = _apply_retention_prune(verbose=verbose)
-    if pruned > 0:
-        print(f"[{_now()}] Retention: pruned {pruned} expired snapshot(s)")
-
+    imported = 0
     pushed = 0
-    if git_sync:
-        pushed = _push_ahead(sync_dir, auto=True, backend=backend)
-        if pushed > 0:
-            print(f"[{_now()}] Pushed {pushed} conversation(s) to remote")
+    if is_chat_sync_enabled():
+        imported = _pull_behind(sync_dir)
+        if imported > 0:
+            print(f"[{_now()}] Imported {imported} conversation(s) from remote")
+
+        pruned = _apply_retention_prune(verbose=verbose)
+        if pruned > 0:
+            print(f"[{_now()}] Retention: pruned {pruned} expired snapshot(s)")
+
+        if git_sync:
+            pushed = _push_ahead(sync_dir, auto=True, backend=backend)
+            if pushed > 0:
+                print(f"[{_now()}] Pushed {pushed} conversation(s) to remote")
+        elif verbose:
+            print(f"[{_now()}] Git sync disabled, skipping push")
     elif verbose:
-        print(f"[{_now()}] Git sync disabled, skipping push")
+        print(f"[{_now()}] Chat sync disabled, skipping chat pull/push")
 
     return imported, pushed
 

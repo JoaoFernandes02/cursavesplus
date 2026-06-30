@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import customtkinter as ctk
 
+from ...chat_lifecycle import is_chat_sync_enabled
 from ..runner import CommandRunner
 from ..widgets import WorkspaceSelector, warn_cursor_running
 
@@ -11,6 +12,15 @@ from ..widgets import WorkspaceSelector, warn_cursor_running
 def build_sync(parent, runner: CommandRunner, require_sync_ready: callable) -> WorkspaceSelector:
     frame = ctk.CTkFrame(parent, fg_color="transparent")
     frame.pack(fill="both", expand=True, padx=8, pady=8)
+
+    if not is_chat_sync_enabled():
+        ctk.CTkLabel(
+            frame,
+            text="Chat sync is disabled (sync.chat_enabled=false). Profile sync still runs via Sync.",
+            wraplength=600,
+            justify="left",
+            text_color=("#b45309", "#fbbf24"),
+        ).pack(anchor="w", padx=4, pady=(0, 8))
 
     ws = WorkspaceSelector(frame, label="Workspace (for scoped actions)")
 

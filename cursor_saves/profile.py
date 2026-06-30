@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from . import paths
 from .backends import load_config
@@ -132,6 +133,163 @@ def _copy_tree(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst)
 
 
+def _merge_tree(src: Path, dst: Path) -> None:
+    """Copy new/changed files from src into dst without removing extra dst files."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for path in src.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(src)
+        target = dst / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists() or path.read_bytes() != target.read_bytes():
+            shutil.copy2(path, target)
+
+
+def _load_hooks_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"version": 1, "hooks": {}}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"version": 1, "hooks": {}}
+
+
+def _save_hooks_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _hook_command_key(entry: dict[str, Any]) -> str:
+    return str(entry.get("command", ""))
+
+
+def _merge_hooks_json_export(local: Path, staging: Path) -> None:
+    """Merge local hooks.json into staging without removing staging-only entries."""
+    local_data = _load_hooks_json(local)
+    staging_data = _load_hooks_json(staging) if staging.is_file() else {"version": 1, "hooks": {}}
+    merged: dict[str, Any] = {
+        "version": local_data.get("version", staging_data.get("version", 1)),
+        "hooks": dict(staging_data.get("hooks", {})),
+    }
+    for event, local_hooks in local_data.get("hooks", {}).items():
+        staged_hooks = list(merged["hooks"].get(event, []))
+        by_command = {_hook_command_key(h): h for h in staged_hooks}
+        for hook in local_hooks:
+            by_command[_hook_command_key(hook)] = hook
+        merged["hooks"][event] = list(by_command.values())
+    _save_hooks_json(staging, merged)
+
+
+def _tree_has_local_additions_or_modifications(local: Path, staged: Path) -> bool:
+    """True if local has files new or changed vs staged (ignores local deletions)."""
+    if not local.exists():
+        return False
+    if not staged.exists():
+        return any(p.is_file() for p in local.rglob("*"))
+    for path in local.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(local)
+        target = staged / rel
+        if not target.is_file() or path.read_bytes() != target.read_bytes():
+            return True
+    return False
+
+
+def _hooks_json_has_local_additions_or_modifications(local: Path, staged: Path) -> bool:
+    if not local.is_file():
+        return False
+    if not staged.is_file():
+        return True
+    local_data = _load_hooks_json(local)
+    staging_data = _load_hooks_json(staged)
+    local_commands: set[str] = set()
+    for hooks in local_data.get("hooks", {}).values():
+        for hook in hooks:
+            local_commands.add(_hook_command_key(hook))
+    staging_by_command: dict[str, dict[str, Any]] = {}
+    for hooks in staging_data.get("hooks", {}).values():
+        for hook in hooks:
+            staging_by_command[_hook_command_key(hook)] = hook
+    for event, hooks in local_data.get("hooks", {}).items():
+        for hook in hooks:
+            key = _hook_command_key(hook)
+            if key not in staging_by_command or hook != staging_by_command[key]:
+                return True
+    return False
+
+
+def _tree_has_local_deletions(local: Path, staged: Path) -> bool:
+    """True if staged has files missing from local."""
+    if not staged.exists():
+        return False
+    if not local.exists():
+        return any(p.is_file() for p in staged.rglob("*"))
+    for path in staged.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(staged)
+        if not (local / rel).is_file():
+            return True
+    return False
+
+
+def _hooks_json_has_local_deletions(local: Path, staged: Path) -> bool:
+    if not staged.is_file():
+        return False
+    if not local.is_file():
+        return True
+    local_commands: set[str] = set()
+    for hooks in _load_hooks_json(local).get("hooks", {}).values():
+        for hook in hooks:
+            local_commands.add(_hook_command_key(hook))
+    for hooks in _load_hooks_json(staged).get("hooks", {}).values():
+        for hook in hooks:
+            if _hook_command_key(hook) not in local_commands:
+                return True
+    return False
+
+
+def _uses_merge_export(entry: ProfileEntry) -> bool:
+    return entry.category in ("skills", "hooks")
+
+
+def _entry_state(entry: ProfileEntry, local: Path, staged: Path) -> str:
+    if entry.is_dir:
+        local_exists = local.is_dir()
+        staged_exists = staged.is_dir()
+    else:
+        local_exists = local.is_file()
+        staged_exists = staged.is_file()
+
+    if not local_exists and not staged_exists:
+        return "missing"
+    if not local_exists:
+        return "remote_only"
+    if not staged_exists:
+        return "local_only"
+
+    if _uses_merge_export(entry):
+        if entry.local_name == "hooks.json":
+            has_add = _hooks_json_has_local_additions_or_modifications(local, staged)
+            has_del = _hooks_json_has_local_deletions(local, staged)
+        else:
+            has_add = _tree_has_local_additions_or_modifications(local, staged)
+            has_del = _tree_has_local_deletions(local, staged)
+        if has_add:
+            return "differ"
+        if has_del:
+            return "local_behind"
+        return "synced"
+
+    local_fp = _path_fingerprint(local, entry.is_dir)
+    staged_fp = _path_fingerprint(staged, entry.is_dir)
+    if local_fp == staged_fp:
+        return "synced"
+    return "differ"
+
+
 def _backup_path(target: Path) -> None:
     if not target.exists():
         return
@@ -175,14 +333,20 @@ def export_profile(profile_dir: Optional[Path] = None) -> int:
                 if entry.optional:
                     continue
                 continue
-            _copy_tree(src, dst)
+            if _uses_merge_export(entry):
+                _merge_tree(src, dst)
+            else:
+                _copy_tree(src, dst)
             exported += 1
         else:
             if not src.is_file():
                 if entry.optional:
                     continue
                 continue
-            _copy_file(src, dst)
+            if entry.category == "hooks" and entry.local_name == "hooks.json":
+                _merge_hooks_json_export(src, dst)
+            else:
+                _copy_file(src, dst)
             exported += 1
 
     return exported
@@ -227,19 +391,7 @@ def profile_status(profile_dir: Optional[Path] = None) -> list[dict]:
     for entry in _enabled_entries():
         local = _local_path(entry)
         staged = _staging_path(profile_dir, entry)
-        local_fp = _path_fingerprint(local, entry.is_dir)
-        staged_fp = _path_fingerprint(staged, entry.is_dir)
-
-        if local_fp is None and staged_fp is None:
-            state = "missing"
-        elif local_fp is None:
-            state = "remote_only"
-        elif staged_fp is None:
-            state = "local_only"
-        elif local_fp == staged_fp:
-            state = "synced"
-        else:
-            state = "differ"
+        state = _entry_state(entry, local, staged)
 
         rows.append(
             {
@@ -254,7 +406,7 @@ def profile_status(profile_dir: Optional[Path] = None) -> list[dict]:
 
 
 def profile_has_local_changes(profile_dir: Optional[Path] = None) -> bool:
-    """Return True if local Cursor files differ from the staged profile."""
+    """Return True if local Cursor files have pushable changes vs staged profile."""
     return any(row["state"] in ("local_only", "differ") for row in profile_status(profile_dir))
 
 

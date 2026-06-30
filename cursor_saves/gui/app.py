@@ -5,7 +5,7 @@ from __future__ import annotations
 import customtkinter as ctk
 
 from . import state
-from .panels import autosync, dashboard, info, profile, setup, sync, tools
+from .panels import autosync, dashboard, info, profile, setup, skills_hooks, sync, tools
 from .runner import CommandRunner
 from .widgets import OutputLog
 
@@ -28,7 +28,7 @@ class CursavesApp(ctk.CTk):
         self.tabview = ctk.CTkTabview(self)
         self.tabview.pack(fill="both", expand=True, padx=8, pady=(8, 4))
 
-        tabs = ["Dashboard", "Sync", "Auto-sync", "Profile", "Info", "Tools", "Setup"]
+        tabs = ["Dashboard", "Sync", "Auto-sync", "Profile", "Skills & Hooks", "Info", "Tools", "Setup"]
         for name in tabs:
             self.tabview.add(name)
 
@@ -91,6 +91,11 @@ class CursavesApp(ctk.CTk):
             require_sync_ready=require_sync_ready,
         )
         profile.build_profile(self.tabview.tab("Profile"), self.runner, require_sync_ready)
+        skills_hooks.build_skills_hooks(
+            self.tabview.tab("Skills & Hooks"),
+            self.runner,
+            require_sync_ready,
+        )
         info.build_info(self.tabview.tab("Info"), self.runner)
         tools.build_tools(
             self.tabview.tab("Tools"),
@@ -123,6 +128,9 @@ class CursavesApp(ctk.CTk):
         setup_tab = self.tabview.tab("Setup")
         if hasattr(setup_tab, "_setup_refresh"):
             setup_tab._setup_refresh()
+        sh = self.tabview.tab("Skills & Hooks")
+        if hasattr(sh, "_skills_hooks_refresh"):
+            sh._skills_hooks_refresh()
 
     def _periodic_refresh(self) -> None:
         self._refresh_status_bar()

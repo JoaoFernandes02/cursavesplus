@@ -114,6 +114,72 @@ class ProfileSyncTests(TempEnvMixin, unittest.TestCase):
         profile.apply_profile()
         self.assertTrue((self.cursor_dot / "skills" / "my-skill" / "SKILL.md").exists())
 
+    def test_skills_local_delete_not_exported(self):
+        skill_dir = self.cursor_dot / "skills" / "my-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# My skill\n")
+        profile.export_profile()
+        staged = self.sync_dir / "profile" / "cursor" / "skills" / "my-skill" / "SKILL.md"
+        self.assertTrue(staged.exists())
+
+        shutil.rmtree(skill_dir)
+        profile.export_profile()
+        self.assertTrue(staged.exists())
+
+    def test_skills_local_edit_exported(self):
+        skill_dir = self.cursor_dot / "skills" / "my-skill"
+        skill_dir.mkdir(parents=True)
+        skill_file = skill_dir / "SKILL.md"
+        skill_file.write_text("# v1\n")
+        profile.export_profile()
+        staged = self.sync_dir / "profile" / "cursor" / "skills" / "my-skill" / "SKILL.md"
+        self.assertEqual(staged.read_text(), "# v1\n")
+
+        skill_file.write_text("# v2\n")
+        profile.export_profile()
+        self.assertEqual(staged.read_text(), "# v2\n")
+
+    def test_skills_local_behind_status(self):
+        skill_dir = self.cursor_dot / "skills" / "my-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# skill\n")
+        profile.export_profile()
+        shutil.rmtree(skill_dir)
+
+        rows = profile.profile_status()
+        skills = [r for r in rows if r["path"] == "cursor/skills"][0]
+        self.assertEqual(skills["state"], "local_behind")
+        self.assertFalse(profile.profile_has_local_changes())
+
+    def test_hooks_script_delete_not_exported(self):
+        hooks_dir = self.cursor_dot / "hooks"
+        hooks_dir.mkdir(parents=True)
+        script = hooks_dir / "my-hook.sh"
+        script.write_text("#!/bin/sh\n")
+        profile.export_profile()
+        staged = self.sync_dir / "profile" / "cursor" / "hooks" / "my-hook.sh"
+        self.assertTrue(staged.exists())
+
+        script.unlink()
+        profile.export_profile()
+        self.assertTrue(staged.exists())
+
+    def test_delete_skill_removes_from_staging(self):
+        from cursor_saves import skills_hooks
+
+        skill_dir = self.cursor_dot / "skills" / "gone-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# gone\n")
+        profile.export_profile()
+        staged = self.sync_dir / "profile" / "cursor" / "skills" / "gone-skill"
+        self.assertTrue(staged.is_dir())
+
+        with mock.patch("cursor_saves.skills_hooks.get_backend") as mock_backend:
+            mock_backend.return_value.has_remote.return_value = False
+            self.assertTrue(skills_hooks.delete_skill("gone-skill"))
+        self.assertFalse(staged.exists())
+        self.assertFalse(skill_dir.exists())
+
     def test_skills_cursor_not_in_catalog(self):
         builtin = self.cursor_dot / "skills-cursor" / "canvas"
         builtin.mkdir(parents=True)
@@ -399,6 +465,28 @@ class CliSyncFlowTests(TempEnvMixin, unittest.TestCase):
                             cmd_sync(Namespace(no_profile=True))
                             mock_export.assert_not_called()
                             mock_apply.assert_not_called()
+
+    def test_cmd_sync_chat_disabled_skips_chat_steps(self):
+        from cursor_saves.cli import _configure_stdio, cmd_sync
+
+        _configure_stdio()
+        bare = self.root / "remote2.git"
+        subprocess.run(["git", "init", "--bare", "-b", "main", str(bare)], check=True, capture_output=True)
+        GitBackend(self.sync_dir).init_repo(remote=str(bare))
+        subprocess.run(["git", "push", "-u", "origin", "main"], cwd=self.sync_dir, check=True, capture_output=True)
+
+        self._config.setdefault("sync", {})["chat_enabled"] = False
+
+        with mock.patch("cursor_saves.cli._pull_behind") as mock_pull:
+            with mock.patch("cursor_saves.cli._push_ahead") as mock_push:
+                with mock.patch("cursor_saves.cli._apply_retention_prune") as mock_retention:
+                    with mock.patch("cursor_saves.cli.get_backend") as mock_backend:
+                        backend = GitBackend(self.sync_dir)
+                        mock_backend.return_value = backend
+                        cmd_sync(Namespace(no_profile=True, verbose=False))
+                        mock_pull.assert_not_called()
+                        mock_push.assert_not_called()
+                        mock_retention.assert_not_called()
 
 
 class SnapshotListingTests(TempEnvMixin, unittest.TestCase):

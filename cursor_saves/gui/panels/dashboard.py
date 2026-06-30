@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import customtkinter as ctk
 
+from ...chat_lifecycle import is_chat_sync_enabled
 from ..runner import CommandRunner
 from .. import state
 
@@ -30,8 +31,17 @@ def build_dashboard(parent, runner: CommandRunner, on_go_setup, refresh_status, 
 
     def refresh_dashboard_ui():
         if state.is_sync_ready():
+            if is_chat_sync_enabled():
+                banner_text = (
+                    "cursaves is ready to sync. Use Sync now or rely on auto-sync hook."
+                )
+            else:
+                banner_text = (
+                    "cursaves is ready — profile/skills/hooks sync is active. "
+                    "Chat sync is disabled (sync.chat_enabled=false)."
+                )
             banner_label.configure(
-                text="cursaves is ready to sync. Use Sync now or rely on auto-sync hook.",
+                text=banner_text,
                 text_color=("gray10", "gray90"),
             )
             stats = state.get_dashboard_stats()

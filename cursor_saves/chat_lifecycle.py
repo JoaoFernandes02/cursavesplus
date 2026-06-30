@@ -21,7 +21,13 @@ DEFAULT_SYNC_CONFIG = {
     "retention_purge_local": False,
     "pinned_composers": [],
     "excluded_composers": [],
+    "chat_enabled": False,
 }
+
+
+def is_chat_sync_enabled() -> bool:
+    """Return True if automatic chat sync is enabled."""
+    return bool(get_sync_config().get("chat_enabled", False))
 
 
 def get_sync_config() -> dict:
